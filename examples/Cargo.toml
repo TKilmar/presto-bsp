@@ -1,0 +1,27 @@
+[package]
+name = "presto-speaker-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+presto-bsp = { path = "../" }
+
+embassy-futures = { version = "0.1.2" }
+embassy-executor = { version = "0.9.0", features = [
+    "arch-cortex-m", 
+    "defmt", 
+    "executor-interrupt", 
+    "executor-thread", 
+] }
+embassy-time = { version = "0.5.0", features = ["defmt-timestamp-uptime", "defmt"] }
+
+cortex-m-rt = "0.7.0"
+cortex-m = { version = "0.7.6", features = ["inline-asm"] }
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+smart-leds = "0.3"
+
+[profile.release]
+debug = 2

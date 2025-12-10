@@ -1,0 +1,36 @@
+[package]
+name = "presto-bsp"
+version = "0.1.0"
+edition = "2024"
+description = "Embassy-based board support package for the Pimoroni Presto (RP2350)"
+license = "MIT"
+keywords = ["embedded", "async", "rp2350", "raspberry-pi", "pimoroni"]
+categories = ["embedded", "hardware-support", "no-std", "asynchronous"]
+repository = "https://github.com/kilmart/presto-bsp"
+
+[dependencies]
+embassy-rp = { version = "0.9.0", features = [
+    "rp235xb",
+    "time-driver",
+    "unstable-pac",
+    "critical-section-impl",
+    "binary-info",
+    "defmt",
+] }
+embassy-time = { version = "0.5.0" }
+embassy-sync = { version = "0.7.2" }
+cortex-m = { version = "0.7.6" }
+embedded-hal = "1.0"
+critical-section = "1.2.0"
+embassy-hal-internal = { version = "0.3.0", features = ["cortex-m", "prio-bits-2"] }
+
+defmt = { version = "^1.0.1", optional = true }
+
+[features]
+default = ["defmt"]
+defmt = [
+    "dep:defmt",
+    "embassy-rp/defmt",
+    "embassy-time/defmt",
+    "embassy-time/defmt-timestamp-uptime",
+]

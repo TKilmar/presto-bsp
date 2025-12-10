@@ -1,0 +1,10 @@
+# Binaries and build artifacts
+**/target
+
+# editor
+*~
+.DS_Store
+
+# Probe-rs/defmt logs
+*.log
+defmt.rtt
