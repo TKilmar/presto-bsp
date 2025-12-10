@@ -4,8 +4,11 @@
 //! this repository: initialise the HAL, set up the board-specific pins, and
 //! hand back a struct containing the relevant peripherals.
 
+use embassy_rp::bind_interrupts;
 pub use embassy_rp::config::Config;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 pub use embassy_rp::interrupt::Priority;
 use embassy_hal_internal::Peri;
 use embassy_rp::peripherals::{
@@ -30,6 +33,14 @@ pub type Backlight = Output<'static>;
 pub type Button = Input<'static>;
 /// Helper type for the piezo speaker driver on GPIO43.
 pub type PiezoSpeaker<'a> = speaker::SoftSpeaker<'a>;
+/// Number of LEDs in the on-board SK6812 strip.
+pub const BOARD_LED_COUNT: usize = 7;
+/// Helper type for the on-board SK6812/WS2812-compatible LED driver.
+pub type BoardWs2812<'d> = PioWs2812<'d, PIO0, 0, BOARD_LED_COUNT, Grb>;
+
+bind_interrupts!(struct Ws2812Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+});
 
 /// SD card pinout.
 pub struct SdCardPins {
@@ -134,5 +145,15 @@ impl Presto {
             uart1: p.UART1,
             lcd: LcdPlaceholder::new(),
         }
+    }
+
+    /// Configure PIO0 and DMA0 for driving the on-board SK6812 strip.
+    ///
+    /// Consumes PIO0, DMA channel 0, and the LED data pin from the board.
+    #[must_use]
+    pub fn into_board_ws2812(self) -> BoardWs2812<'static> {
+        let Pio { mut common, sm0, .. } = Pio::new(self.pio0, Ws2812Irqs);
+        let program = PioWs2812Program::new(&mut common);
+        PioWs2812::new(&mut common, sm0, self.dma_ch0, self.led_data, &program)
     }
 }

@@ -7,6 +7,7 @@ pub use board::*;
 
 pub mod lcd;
 pub mod speaker;
+pub mod touch;
 
 // Re-exports
 pub use embassy_rp;
