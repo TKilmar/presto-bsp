@@ -22,6 +22,12 @@ defmt = "1.0.1"
 defmt-rtt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 smart-leds = "0.3"
+embedded-alloc = "0.5"
+
+slint = { version = "1.14.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
+
+[build-dependencies]
+slint-build = "1.14"
 
 [profile.release]
 debug = 2

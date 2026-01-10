@@ -1,32 +1,27 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use defmt::*;
 use embassy_executor::Spawner;
-use presto_bsp::touch::Ft6236;
-use presto_bsp::embassy_rp::{
-    bind_interrupts,
-    i2c::{self, InterruptHandler},
-    peripherals::I2C0,
-};
 use presto_bsp::Presto;
 use {defmt_rtt as _, panic_probe as _};
 
-bind_interrupts!(struct Irqs {
-    I2C0_IRQ => InterruptHandler<I2C0>;
-});
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    
+    // Simple bump allocator for Slint/alloc users.
+    const HEAP_SIZE: usize = 200 * 1024;
+    static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+    #[global_allocator]
+    static ALLOCATOR: embedded_alloc::Heap = embedded_alloc::Heap::empty();
+    unsafe { ALLOCATOR.init(core::ptr::addr_of_mut!(HEAP) as usize, HEAP_SIZE) }
+
     info!("Starting FT6236 touch demo");
-    let board = Presto::default();
-
-    let i2c_config = i2c::Config::default();
-    let i2c_bus = i2c::I2c::new_async(board.i2c0, board.i2c.scl, board.i2c.sda, Irqs, i2c_config);
-
-    // The user button is used as a placeholder for the interrupt pin in this demo.
-    // Replace `board.button` with the real FT6236 INT pin when connected.
-    let mut touch = Ft6236::new(i2c_bus, board.button, false);
+    let mut board = Presto::default();
+    let mut touch = board.touch;
 
     loop {
         match touch.read_event().await {

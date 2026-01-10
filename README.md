@@ -15,6 +15,8 @@ Inspired by the excellent [`microbit-bsp`](https://github.com/lulf/microbit-bsp)
 - `GPIO33` – SK6812 LED strip data (7 LEDs on board)
 - `GPIO43` – Piezo speaker
 - `GPIO34-39` – SD card interface (CLK, CMD, D0..D3)
+- `GPIO30/31` – Dedicated FT6236 touch I2C bus
+- `GPIO32` – FT6236 interrupt pin
 - `GPIO45` – AD3031 LCD backlight enable
 - `GPIO46` – User button
 - `GPIO40/41` – I2C bus for add-ons

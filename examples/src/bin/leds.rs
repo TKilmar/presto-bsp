@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Ticker};
@@ -25,6 +27,13 @@ fn wheel(mut wheel_pos: u8) -> RGB8 {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    // Simple bump allocator for Slint/alloc users.
+    const HEAP_SIZE: usize = 200 * 1024;
+    static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+    #[global_allocator]
+    static ALLOCATOR: embedded_alloc::Heap = embedded_alloc::Heap::empty();
+    unsafe { ALLOCATOR.init(core::ptr::addr_of_mut!(HEAP) as usize, HEAP_SIZE) }
+
     info!("Start LEDs");
     let board = Presto::default();
 

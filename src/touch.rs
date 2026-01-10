@@ -37,13 +37,21 @@ impl From<u8> for TouchEventCode {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum TouchGesture {
+    /// No gesture detected.
     None = 0x00,
+    /// Downward swipe.
     SlideDown = 0x01,
+    /// Upward swipe.
     SlideUp = 0x02,
+    /// Leftward swipe.
     SlideLeft = 0x03,
+    /// Rightward swipe.
     SlideRight = 0x04,
+    /// Single tap.
     SingleClick = 0x05,
+    /// Double tap.
     DoubleClick = 0x0B,
+    /// Long-press.
     LongPress = 0x0C,
 }
 
@@ -65,7 +73,9 @@ impl From<u8> for TouchGesture {
 /// Error type for the driver.
 #[derive(Debug)]
 pub enum TouchError<E> {
+    /// I2C bus error.
     Bus(E),
+    /// Interrupt pin error.
     Pin,
 }
 
@@ -79,9 +89,13 @@ impl<E> From<E> for TouchError<E> {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TouchPoint {
+    /// Finger identifier reported by the controller.
     pub id: u8,
+    /// X coordinate (scaled if requested).
     pub x: u16,
+    /// Y coordinate (scaled if requested).
     pub y: u16,
+    /// Whether the finger is currently active.
     pub active: bool,
 }
 
@@ -89,8 +103,11 @@ pub struct TouchPoint {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TouchReport {
+    /// Decoded gesture code.
     pub gesture: TouchGesture,
+    /// Number of touches reported (may exceed provided slots).
     pub touches: u8,
+    /// Up to two parsed touch points.
     pub points: [Option<TouchPoint>; 2],
 }
 
