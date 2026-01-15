@@ -23,9 +23,9 @@ pub enum DisplayError {
 ///
 /// Two buffers are reserved so callers can render into one while the other is being
 /// pushed to the panel.
-pub struct Display<'d, PIO: Instance, const SM: usize> {
+pub struct Display<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, const SM3: usize> {
     /// Underlying ST7701 transport/streaming driver.
-    pub lcd: St7701<'d, PIO, SM>,
+    pub lcd: St7701<'d, PIO, SM0, SM1, SM2, SM3>,
     /// Front buffer for scanning out.
     pub front: &'d mut [sr::Rgb565Pixel],
     /// Back buffer for rendering.
@@ -34,12 +34,14 @@ pub struct Display<'d, PIO: Instance, const SM: usize> {
     swap_req: Channel<NoopRawMutex, (), 1>,
 }
 
-impl<'d, PIO: Instance, const SM: usize> Display<'d, PIO, SM> {
+impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, const SM3: usize>
+    Display<'d, PIO, SM0, SM1, SM2, SM3>
+{
     /// Create a new double-buffered display using PSRAM.
     ///
     /// The `psram` slice is divided into two equal RGB565 buffers of size
     /// `DISPLAY_WIDTH * DISPLAY_HEIGHT`. Returns an error if PSRAM is too small.
-    pub fn new(lcd: St7701<'d, PIO, SM>, psram: &'d Psram<'d>) -> Result<Self, DisplayError> {
+    pub fn new(lcd: St7701<'d, PIO, SM0, SM1, SM2, SM3>, psram: &'d Psram<'d>) -> Result<Self, DisplayError> {
         let pixels = DISPLAY_WIDTH * DISPLAY_HEIGHT;
         let buf_bytes = pixels * mem::size_of::<sr::Rgb565Pixel>();
         if buf_bytes * 2 > psram.size() {

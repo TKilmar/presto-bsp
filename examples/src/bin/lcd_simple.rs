@@ -23,8 +23,8 @@ async fn main(_spawner: Spawner) {
     let mut board = Presto::default();
     let mut lcd = board.lcd;
 
-    // If you have a command transport hooked up, run panel init here.
-    board.backlight.set_high();
+    info!("Set backlight to 100");
+    board.backlight.set_percent(100);
 
     // Basic RGB565 colors.
     let colors = [0xF800u16, 0x07E0, 0x001F, 0xFFFF, 0x0000];
@@ -42,11 +42,11 @@ async fn main(_spawner: Spawner) {
                     buffer.as_mut_ptr() as *mut sr::Rgb565Pixel,
                     buffer.len(),
                 );
-                let _ = lcd.write_buffer(pixels).await;
                 info!("New Color");
+                let _ = lcd.write_buffer(pixels).await;
             }
 
-            Timer::after(Duration::from_secs(1)).await;
+            Timer::after(Duration::from_secs(10)).await;
         }
     }
 }
