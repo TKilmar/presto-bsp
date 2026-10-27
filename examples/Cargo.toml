@@ -14,6 +14,14 @@ embassy-executor = { version = "0.9.0", features = [
     "executor-interrupt", 
     "executor-thread", 
 ] }
+embassy-rp = { version = "0.9.0", features = [
+    "rp235xb",
+    "time-driver",
+    "unstable-pac",
+    "critical-section-impl",
+    "binary-info",
+    "defmt",
+] }
 embassy-time = { version = "0.5.0", features = ["defmt-timestamp-uptime", "defmt"] }
 
 cortex-m-rt = "0.7.0"

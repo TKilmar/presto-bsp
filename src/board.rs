@@ -6,7 +6,7 @@
 
 use defmt::debug;
 use embassy_rp::bind_interrupts;
-use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::clocks::{clk_sys_freq, ClockConfig, PeriClkSrc, PllConfig, SysClkConfig, SysClkSrc};
 pub use embassy_rp::config::Config;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{self, Async, InterruptHandler as I2cInterruptHandler};
@@ -17,7 +17,7 @@ pub use embassy_rp::interrupt::Priority;
 use embassy_hal_internal::Peri;
 use embassy_rp::peripherals::{
     DMA_CH0, I2C0, I2C1, PIO0, PIO1, PIN_33, PIN_34, PIN_35, PIN_36, PIN_37, PIN_38, PIN_39,
-    PIN_40, PIN_41, PIN_43, PIN_45, PIN_46, PWM_SLICE10, SPI0, UART0, UART1,
+    PIN_40, PIN_41, PIN_43, PIN_45, PIN_46, SPI0, UART0, UART1,
 };
 use embassy_rp::psram::Psram;
 use embassy_rp::spi::Spi;
@@ -72,7 +72,7 @@ pub const BOARD_LED_COUNT: usize = 7;
 /// Helper type for the on-board SK6812/WS2812-compatible LED driver.
 pub type BoardWs2812<'d> = PioWs2812<'d, PIO0, 0, BOARD_LED_COUNT, Grb>;
 /// Helper type for the on-board LCD driver.
-pub type BoardLcd<'d> = St7701<'d, PIO1, 0, 1, 2, 3>;
+pub type BoardLcd<'d> = St7701<'d, PIO1, 0, 1>;
 
 const BACKLIGHT_PWM_HZ: u32 = 100;
 const BACKLIGHT_PWM_TOP: u16 = 10_000 - 1;
@@ -147,31 +147,54 @@ pub struct Presto {
     pub touch: Ft6236<i2c::I2c<'static, I2C1, Async>, Input<'static>>,
     /// On-board LCD driver.
     pub lcd: BoardLcd<'static>,
-    // PSRAM used for display buffers and slint heap.
+    // PSRAM used for Slint heap or application data; display buffer stays in SRAM.
     pub psram: Psram<'static>
 }
 
 impl Default for Presto {
     fn default() -> Self {
-        Self::new(Default::default())
+        Self::new(Self::default_config())
     }
 }
 
 impl Presto {
+    /// Default HAL configuration for the Presto board (200MHz sysclk, PLL VCO 1.2GHz).
+    pub fn default_config() -> embassy_rp::config::Config {
+        let mut clocks = ClockConfig::crystal(12_000_000);
+        if let Some(xosc) = &mut clocks.xosc {
+            xosc.sys_pll = Some(PllConfig {
+                refdiv: 1,
+                fbdiv: 100,
+                post_div1: 6,
+                post_div2: 1,
+            });
+        }
+        clocks.sys_clk = SysClkConfig {
+            src: SysClkSrc::PllSys,
+            div_int: 1,
+            div_frac: 0,
+        };
+        clocks.peri_clk_src = Some(PeriClkSrc::Sys);
+
+        embassy_rp::config::Config::new(clocks)
+    }
+
     /// Create a new board instance using the provided HAL configuration.
     #[must_use]
     pub fn new(config: embassy_rp::config::Config) -> Self {
         let p = embassy_rp::init(config);
 
         // configure psram
-        let psram_config = embassy_rp::psram::Config::aps6404l();
+        let mut psram_config = embassy_rp::psram::Config::aps6404l();
+        psram_config.clock_hz = 94_000_000;
+        psram_config.dummy_cycles = 24;
         let psram = Psram::new(embassy_rp::qmi_cs1::QmiCs1::new(p.QMI_CS1, p.PIN_47), psram_config).unwrap();
         debug!("PSRAM configured");
 
         // configure lcd using pio
         let _r2 = Output::new(p.PIN_17, Level::Low); // unused 18 bit interface pins
         let _g2 = Output::new(p.PIN_18, Level::Low);
-        let Pio { mut common, irq_flags, sm0, sm1, sm2, sm3, .. } = Pio::new(p.PIO1, LcdIrqs);
+        let Pio { mut common, irq_flags, sm0, sm1, .. } = Pio::new(p.PIO1, LcdIrqs);
         let lcd_data_pins = [
             common.make_pio_pin(p.PIN_1),
             common.make_pio_pin(p.PIN_2),
@@ -209,17 +232,14 @@ impl Presto {
             irq_flags,
             sm0,
             sm1,
-            sm2,
-            sm3,
             p.DMA_CH1,
-            p.DMA_CH2,
             lcd_data_pins,
             lcd_dotclk,
             lcd_hsync,
             lcd_vsync,
             lcd_de,
             lcd_spi_cs,
-            lcd_spi
+            lcd_spi,
         );
         lcd.init().unwrap();
 

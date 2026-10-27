@@ -1,9 +1,24 @@
-use defmt::{debug, info};
+use defmt::info;
 use embassy_hal_internal::Peri;
-use embassy_rp::{
-    clocks::clk_sys_freq, dma::{AnyChannel, Channel}, gpio::Output, peripherals::SPI1, pio::{self, Common, Config, FifoJoin, Instance, Irq, Pin, StateMachine, program::pio_asm}, spi::{Blocking, Spi}
+use embassy_rp::pio::{
+        self,
+        Common,
+        Config,
+        FifoJoin,
+        Instance,
+        Pin,
+        ShiftConfig,
+        StateMachine,
+        program::{InstructionOperands, MovDestination, MovOperation, MovSource, pio_asm},
 };
-use fixed::types::U24F8;
+use embassy_rp::{
+    clocks::clk_sys_freq,
+    dma::{AnyChannel, Channel},
+    gpio::Output,
+    peripherals::SPI1,
+    spi::{Blocking, Spi},
+};
+use fixed::{traits::ToFixed, types::U24F8};
 use embassy_time::{Duration, block_for};
 use slint::platform::software_renderer as sr;
 
@@ -11,9 +26,6 @@ use slint::platform::software_renderer as sr;
 pub const DISPLAY_WIDTH: usize = 480;
 /// Default display height in pixels.
 pub const DISPLAY_HEIGHT: usize = 480;
-const DOTCLK_PERIODS: u32 = 261_360;
-const HSYNC_LINES: u32 = 495;
-const HSYNC_HIGH_PERIODS: u32 = 526;
 
 /// Errors that can be raised by the LCD driver.
 #[derive(Debug)]
@@ -32,7 +44,7 @@ impl LcdPlaceholder {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, missing_docs)]
 #[derive(Copy, Clone)]
 #[repr(u8)]
 pub enum DataCommand {
@@ -41,7 +53,7 @@ pub enum DataCommand {
 }
 
 /// ST7701 register addresses.
-#[allow(dead_code)]
+#[allow(dead_code, missing_docs)]
 #[derive(Copy, Clone)]
 #[repr(u8)]
 pub enum Register {
@@ -92,20 +104,17 @@ pub enum Register {
 /// and call [`write_buffer`](Self::write_buffer) to push it to the panel. Synchronisation signals
 /// are kept high and only a dot clock is toggled; the panel must already be configured for
 /// data-enable mode by application code.
-pub struct St7701<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, const SM3: usize> {
-    sm_dotclk: StateMachine<'d, PIO, SM0>,
-    sm_hsync: StateMachine<'d, PIO, SM1>,
-    sm_vsync: StateMachine<'d, PIO, SM2>,
-    sm_data: StateMachine<'d, PIO, SM3>,
+pub struct St7701<'d, PIO: Instance, const SM0: usize, const SM1: usize> {
+    sm_sync: StateMachine<'d, PIO, SM0>,
+    sm_data: StateMachine<'d, PIO, SM1>,
     dma: Peri<'d, AnyChannel>,
-    dma2: Peri<'d, AnyChannel>,
     irq_flags: pio::IrqFlags<'d, PIO>,
     cs: Output<'d>,
     spi: Spi<'d, SPI1, Blocking>,
 }
 
-impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, const SM3: usize>
-    St7701<'d, PIO, SM0, SM1, SM2, SM3>
+impl<'d, PIO: Instance, const SM0: usize, const SM1: usize>
+    St7701<'d, PIO, SM0, SM1>
 {
     /// Create a new ST7701 stream.
     ///
@@ -119,141 +128,151 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, co
     pub fn new(
         common: &mut Common<'d, PIO>,
         irq_flags: pio::IrqFlags<'d, PIO>,
-        mut sm_dotclk: StateMachine<'d, PIO, SM0>,
-        mut sm_hsync: StateMachine<'d, PIO, SM1>,
-        mut sm_vsync: StateMachine<'d, PIO, SM2>,
-        mut sm_data: StateMachine<'d, PIO, SM3>,
+        mut sm_sync: StateMachine<'d, PIO, SM0>,
+        mut sm_data: StateMachine<'d, PIO, SM1>,
         dma: Peri<'d, impl Channel>,
-        dma2: Peri<'d, impl Channel>,
         data_pins: [Pin<'d, PIO>; 16],
         dotclk: Pin<'d, PIO>,
         hsync: Pin<'d, PIO>,
         vsync: Pin<'d, PIO>,
         de: Pin<'d, PIO>,
         cs: Output<'d>,
-        spi: Spi<'d, SPI1, Blocking>
+        spi: Spi<'d, SPI1, Blocking>,
     ) -> Self {
 
-        let prg_dotclk = pio_asm!(
-            ".side_set 1",
-            "pull block side 0",
+        // 10 instructions, 2 periods per instruction
+        let prg_sync = pio_asm!(
+            ".side_set 2",
             ".wrap_target",
-            "mov x, osr side 0",
-            "wait 0 irq 1 side 0",
-            "loop:",
-            "nop side 1",
-            "jmp x--, loop side 0",
-            ".wrap",
+
+            "set y, 12          side 0b11", // 12+1 for vbp
+            "wait 0 irq 0       side 0b11", // idle
+            "irq set 4          side 0b11", // sync with faster sm from slower sm
+
+            "set x, 21          side 0b00", // vsync, 4 clks
+            "line:"
+            "jmp x--, line [5]  side 0b11"  // line 0, (21+1)*6*4=528 + 8 = 536, clks actual is 536
+            
+            "set x, 20          side 0b10", // hsync, 4 clks
+            "jmp y--, line [5]  side 0b11", // repeat 12 times for vbp
+
+            "mov y, osr         side 0b11", // load 482 lines
+            "data:",
+            "set x, 21          side 0b11", //
+            "line2:"
+            "jmp x--, line2 [5] side 0b11"  // line x, 22*5*4=528 clks
+            "jmp y--, data      side 0b10", // hsync, 4 clks
+            ".wrap"
+        );
+        
+        // 20 instructions, 2 instructions per period
+        let prg_data = pio_asm!(
+            ".side_set 2",              // 0b CLK DE 
+            
+            ".wrap_target",
+            "mov osr, rxfifo[0] side 0b00", // rx0 has vbp clks 6864
+            "mov x, isr         side 0b00"  // isr has W&H 480
+            "wait 1 irq 4   [2] side 0b00", // wait for frame start signal
+            "out y, 32      [4] side 0b00",
+
+            "vbp:",                        
+            "nop                side 0b10",
+            "jmp y--, vbp       side 0b00",
+            
+            "set y, 24          side 0b01", // hbp + hsync, 24 clocks
+            "hbp:",                         
+            "nop                side 0b10", 
+            "jmp y--, hbp       side 0b00", 
+            
+            "mov y, isr         side 0b00", // outputs 480 data pixels
+            "data:",                        
+            "out pins, 16       side 0b01",
+            "jmp y--, data      side 0b11",
+            
+            "set y, 24          side 0b00", // hfp, 24 clocks
+            "hfp:",
+            "nop                side 0b10", 
+            "jmp y--, hfp       side 0b00",
+
+            "jmp x--, hbp       side 0b00", // repeats for each data line
+
+            "mov osr, rxfifo[1] side 0b00", // rx1 holds vfp clks, 1028
+            "out y, 32          side 0b00",
+            "vfp:",                        
+            "nop                side 0b10",
+            "jmp y--, vfp       side 0b00",
+            "irq set 0          side 0b00",
+            ".wrap"
         );
 
-        let prg_vsync = pio_asm!(
-            ".side_set 1",
-            ".wrap_target",
-            "set x, 2 side 1",
-            "wait 0 irq 1 side 1",
-            "loop:",
-            "jmp x--, loop side 0",
-            "irq set 1 side 0",
-            ".wrap",
-        );
-
-        let prg_hsync = pio_asm!(
-            ".side_set 1",
-            "pull block side 1",
-            "mov isr, osr side 1",
-            "pull block side 1",
-            ".wrap_target",
-            "mov y, osr side 1",
-            "wait 0 irq 1 side 1",
-            "line:",
-            "set x, 2 side 0",
-            "sync:",
-            "jmp x--, sync side 0",
-            "mov x, isr side 1",
-            "rest:",
-            "jmp x--, rest side 1",
-            "jmp y--, line side 1",
-            ".wrap",
-        );
-
-        let prog_data = pio_asm!(
-            ".side_set 1",
-            "set pins, 0 side 0",
-            ".wrap_target",
-            "wait 1 irq 0 side 0",
-            "irq clear 0 side 0",
-            "pull side 1",
-            ".wrap",
-        );
-
-        let program_dotclk = common.load_program(&prg_dotclk.program);
-        let program_hsync = common.load_program(&prg_hsync.program);
-        let program_vsync = common.load_program(&prg_vsync.program);
-        let program_data = common.load_program(&prog_data.program);
+        let program_sync = common.load_program(&prg_sync.program);
+        let program_data = common.load_program(&prg_data.program);
 
         let data_refs: [&Pin<'d, PIO>; 16] = core::array::from_fn(|idx| &data_pins[idx]);
-        let clk_refs = [&dotclk];
-        let hsync_refs = [&hsync];
-        let vsync_refs = [&vsync];
-        let de_refs = [&de];
+        let clk_refs = [&de, &dotclk];
+        let sync_refs = [&hsync, &vsync];
 
-        let mut cfg_dotclk = Config::default();
-        cfg_dotclk.use_program(&program_dotclk, &clk_refs);
-        cfg_dotclk.fifo_join = FifoJoin::TxOnly;
-
-        let mut cfg_hsync = Config::default();
-        cfg_hsync.use_program(&program_hsync, &hsync_refs);
-        cfg_hsync.fifo_join = FifoJoin::TxOnly;
-
-        let mut cfg_vsync = Config::default();
-        cfg_vsync.use_program(&program_vsync, &vsync_refs);
+        let mut cfg_sync = Config::default();
+        cfg_sync.use_program(&program_sync, &sync_refs);
+        cfg_sync.fifo_join = FifoJoin::Duplex;
 
         let mut cfg_data = Config::default();
-        cfg_data.use_program(&program_data, &de_refs);
+        cfg_data.use_program(&program_data, &clk_refs);
         cfg_data.set_out_pins(&data_refs);
-
+        cfg_data.fifo_join = FifoJoin::RxAsControl;
+        cfg_data.shift_out = ShiftConfig { 
+            threshold: 32, 
+            direction: pio::ShiftDirection::Right, 
+            auto_fill: true 
+        };
+        
         // Target ~12 MHz dot clock by default; adjust as needed
         let sys_khz = U24F8::from_num(clk_sys_freq() / 1000);
-        let dotclk_khz = U24F8::from_num(100);
-        cfg_dotclk.clock_divider = sys_khz / dotclk_khz;
-        cfg_hsync.clock_divider = sys_khz / dotclk_khz;
-        cfg_vsync.clock_divider = sys_khz / dotclk_khz;
-        cfg_data.clock_divider = sys_khz / dotclk_khz;
+        let dotclk_khz = U24F8::from_num(8_000);
+        cfg_sync.clock_divider = (sys_khz / dotclk_khz * 4).to_fixed();
+        cfg_data.clock_divider = (sys_khz / dotclk_khz / 2).to_fixed();
 
-        irq_flags.set(1);
+        irq_flags.set(0);
 
-        sm_dotclk.set_config(&cfg_dotclk);
-        sm_dotclk.set_pin_dirs(pio::Direction::Out, &clk_refs);
-        sm_dotclk.clear_fifos();
-        sm_dotclk.tx().push(DOTCLK_PERIODS - 1);
-        sm_dotclk.set_enable(true);
+        let pull = InstructionOperands::PULL { if_empty: false, block: false }.encode();
+        let mov_osr_to_isr = InstructionOperands::MOV {
+            destination: MovDestination::ISR,
+            op: MovOperation::None,
+            source: MovSource::OSR,
+        }.encode();
+
+        sm_sync.set_config(&cfg_sync);
+        sm_sync.set_pin_dirs(pio::Direction::Out, &sync_refs);
+        sm_sync.tx().push(DISPLAY_WIDTH as u32);
+        unsafe {
+            sm_sync.exec_instr(pull);
+        }
         
-        sm_hsync.set_config(&cfg_hsync);
-        sm_hsync.set_pin_dirs(pio::Direction::Out, &hsync_refs);
-        sm_hsync.clear_fifos();
-        sm_hsync.tx().push(HSYNC_LINES - 1);
-        sm_hsync.tx().push(HSYNC_HIGH_PERIODS - 1);
-        sm_hsync.set_enable(true);
-
-        sm_vsync.set_config(&cfg_vsync);
-        sm_vsync.set_pin_dirs(pio::Direction::Out, &vsync_refs);
-        sm_vsync.set_enable(true);
-
         sm_data.set_config(&cfg_data);
         sm_data.set_pin_dirs(pio::Direction::Out, &data_refs);
-        sm_data.set_pin_dirs(pio::Direction::Out, &de_refs);
+        sm_data.set_pin_dirs(pio::Direction::Out, &clk_refs);
         sm_data.clear_fifos();
-        sm_data.set_enable(false);
+        sm_data.set_rxf_entry(0, 6864);
+        sm_data.set_rxf_entry(1, 1028);
+        sm_data.tx().push((DISPLAY_WIDTH-1) as u32);
+        unsafe {
+            sm_data.exec_instr(pull);
+            sm_data.exec_instr(mov_osr_to_isr);
+        }
+
+        common.apply_sm_batch(|batch| {
+            batch.restart(&mut sm_data);
+            batch.restart(&mut sm_sync);
+            batch.set_enable(&mut sm_data, true);
+            batch.set_enable(&mut sm_sync, true);
+        });
 
         block_for(Duration::from_millis(1));
 
         Self {
-            sm_dotclk,
-            sm_hsync,
-            sm_vsync,
+            sm_sync,
             sm_data,
             dma: dma.into(),
-            dma2: dma2.into(),
             irq_flags,
             cs,
             spi,
@@ -359,8 +378,10 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize, co
         if pixels.len() < expected {
             return Err(Error::IncorrectBufferLength);
         }
-        info!("Pushing data");
-        self.irq_flags.clear(1);
+        let words: &[u16] = unsafe { core::slice::from_raw_parts(pixels.as_ptr() as *const u16, expected) };
+        let dma_tx = self.sm_data.tx().dma_push(self.dma.reborrow(), words, false);
+        self.irq_flags.clear(0);
+        dma_tx.await;
         Ok(())
     }
 }

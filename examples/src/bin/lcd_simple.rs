@@ -27,7 +27,7 @@ async fn main(_spawner: Spawner) {
     board.backlight.set_percent(100);
 
     // Basic RGB565 colors.
-    let colors = [0xF800u16, 0x07E0, 0x001F, 0xFFFF, 0x0000];
+    let colors = [0xF803u16, 0x07E0, 0x001F, 0xFFFF, 0x0000];
 
     // Create a buffer in PSRAM
     let base = board.psram.base_address() as *mut sr::Rgb565Pixel;
