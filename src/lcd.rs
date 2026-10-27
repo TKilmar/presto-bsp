@@ -23,9 +23,10 @@
 //! bit-reverses each pixel with `mov pins, ::osr`; the frame buffer holds ordinary little-endian
 //! [`Rgb565Pixel`] values that Slint can render into directly.
 //!
-//! The frame buffer (450 KiB) lives in SRAM. PSRAM over QSPI cannot sustain the 33 MB/s the
-//! panel needs at 60 Hz while the CPU is also using it, and any underrun would stall the data
-//! state machine mid-line.
+//! The frame buffer (450 KiB) can live in SRAM, scanned out as above, or in PSRAM. PSRAM reads
+//! over QSPI can take microseconds while the CPU uses the bus, which would stall the DMA engine
+//! and the data state machine with it, so for a PSRAM frame buffer core 1 takes over the pixel
+//! stream (see [`ring`]) and channels *A*/*B* are not used.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, compiler_fence};
 
@@ -155,35 +156,35 @@ static LINE_TABLE_ADDR: AtomicU32 = AtomicU32::new(0);
 /// the scanned-out buffer at the next frame boundary.
 static FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
 
-/// PSRAM frame buffers are not scanned out directly: PSRAM shares the QSPI bus with code
-/// running from flash and with the CPU drawing, so its throughput (~40 MB/s) is bursty, and a
-/// late word would stall the data state machine mid-line. Instead core 1 keeps this SRAM ring
-/// [`ring::LEAD`] words ahead of the scan-out DMA, copying from PSRAM with DMA channel 8. The
-/// scan-out DMA reads only SRAM; a slow copy at worst shows a few stale pixels.
+/// PSRAM frame buffers are not scanned out by DMA. PSRAM shares the QSPI bus with code running
+/// from flash and with the CPU drawing, so a PSRAM read can take microseconds, and while the
+/// DMA engine waits for one it cannot feed the panel either: the data state machine's FIFO
+/// lasts only 1.3 µs.
 ///
-/// Core 1 also restarts the pixel stream at the end of every frame (like Pimoroni's driver
-/// does): it resets the data state machine and points the scan-out DMA back at the first pixel.
-/// If the data state machine was ever starved for long enough to miss a line, the error lasts
-/// one frame instead of shifting the picture down for good.
+/// Instead core 1 is dedicated to the panel, like in Pimoroni's driver:
+///
+/// * DMA channel 8 copies the frame from PSRAM into this SRAM ring in [`ring::CHUNK`]-word
+///   pieces, keeping up to [`ring::LEAD`] words ahead. A slow copy only delays the copy.
+/// * Core 1 itself moves words from the ring into the data state machine's FIFO, running from
+///   SRAM with interrupts off, so nothing it needs is ever behind the QSPI bus. If the copy
+///   falls behind it sends the stale ring contents rather than stalling (a few wrong pixels for
+///   one frame, counted by [`St7701::underruns`]).
+/// * At the end of every frame it resets the data state machine and starts again from the first
+///   pixel, so a glitch can never shift the picture.
 pub mod ring {
-    /// Ring size in 32-bit words (32 KiB, ~34 lines, the largest DMA ring). Large, because code
-    /// running from flash shares the QSPI bus and holds off the copy while rendering.
-    pub const WORDS: u32 = 8192;
-    /// log2 of the ring size in bytes, for the DMA ring setting.
-    pub(super) const SIZE_BITS: u8 = 15;
+    /// Ring size in 32-bit words (64 KiB, ~68 lines).
+    pub const WORDS: u32 = 16384;
     /// Words copied per DMA transfer (divides both the ring and the frame).
     pub const CHUNK: u32 = 256;
-    /// How far core 1 keeps the copy ahead of the scan-out, in words (~1.1 ms at 47 Hz).
-    pub const LEAD: u32 = 7168;
-    /// Words copied before the scan-out restarts each frame; must fit in vertical blanking.
-    pub(super) const PREFILL: u32 = 2048;
+    /// How far the copy runs ahead of the scan-out, in words (~2.4 ms at 47 Hz).
+    pub const LEAD: u32 = 15360;
 }
 
-#[repr(C, align(32768))]
+#[repr(C, align(4))]
 struct Ring([u32; ring::WORDS as usize]);
 
-static mut RING: Ring = Ring([0; ring::WORDS as usize]);
-/// Read by the scan-out re-arm channel in ring mode.
+/// Address of the ring; set by [`FrameBuffer::in_psram`], which owns the ring's storage so that
+/// firmware with an SRAM frame buffer does not link it.
 static RING_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Times the copy fell behind the scan-out (diagnostics).
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
@@ -191,172 +192,132 @@ static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 static STALLS: AtomicU32 = AtomicU32::new(0);
 /// Frames that had not been fully sent when the next one was due (diagnostics).
 static LATE_FRAMES: AtomicU32 = AtomicU32::new(0);
-/// Frame position (in words) up to which the ring has been filled this frame; `u32::MAX` while
-/// no ring is in use. CPU writes to a PSRAM frame buffer compare it with the live scan-out
-/// position and wait while the ring is running low.
-static RING_COPIED: AtomicU32 = AtomicU32::new(u32::MAX);
+/// How many words the ring is ahead of the scan-out; `u32::MAX` while no ring is in use.
+/// Updated continuously by core 1. CPU writes to a PSRAM frame buffer wait while it is low.
+static RING_LEAD: AtomicU32 = AtomicU32::new(u32::MAX);
 static mut CORE1_STACK: Stack<2048> = Stack::new();
 /// DMA channel core 1 uses to copy PSRAM into the ring.
 const COPY_DMA: u8 = 8;
 const FRAME_WORDS: u32 = (FRAME_PIXELS / 2) as u32;
 
-/// Copy `words` words from PSRAM with the XIP streaming FIFO and DMA channel 8, and wait.
-///
-/// The QSPI controller fetches the block into its streaming FIFO in the background, and the DMA
-/// only reads that FIFO when a word is ready. A plain DMA read of PSRAM would make the DMA's read
-/// master wait for the QSPI bus (busy with the CPU drawing), and the scan-out channel, which
-/// shares that master, would starve the data state machine.
+/// Start copying `words` words from `src` to `dst` with the copy channel (does not wait).
 #[inline(always)]
-fn copy_words(src: u32, dst: u32, words: u32) {
+fn start_copy(src: u32, dst: u32, words: u32) {
     use pac::dma::vals::{DataSize, TreqSel};
     let ch = pac::DMA.ch(COPY_DMA as usize);
-    const STREAM: bool = true;
-    if STREAM {
-        // Streaming addresses are in the cached window (0x11xx_xxxx for PSRAM); reads bypass the cache.
-        pac::XIP_CTRL.stream_addr().write(|w| w.set_stream_addr(((src & 0x03ff_ffff) | 0x1000_0000) >> 2));
-        pac::XIP_CTRL.stream_ctr().write(|w| w.set_stream_ctr(words));
-        ch.read_addr().write_value(pac::XIP_AUX.stream().as_ptr() as u32);
-    } else {
-        ch.read_addr().write_value(src);
-    }
+    ch.read_addr().write_value(src);
     ch.write_addr().write_value(dst);
     ch.trans_count().write(|w| w.set_count(words));
     compiler_fence(Ordering::SeqCst);
     ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(if STREAM { TreqSel::XIP_STREAM } else { TreqSel::from(DREQ_FORCE) });
+        w.set_treq_sel(TreqSel::from(DREQ_FORCE));
         w.set_data_size(DataSize::SIZE_WORD);
-        w.set_incr_read(!STREAM);
+        w.set_incr_read(true);
         w.set_incr_write(true);
         w.set_chain_to(COPY_DMA);
         w.set_en(true);
     });
-    while ch.ctrl_trig().read().busy() {}
-    compiler_fence(Ordering::SeqCst);
 }
 
-/// Copy the chunk at frame position `position` (in words) of `frame` into the ring.
+/// Put the data state machine back at the start of its program with empty FIFOs. The clock
+/// divider keeps running, so the pixel phase relative to the dot clock is unchanged.
 #[inline(always)]
-fn copy_chunk(frame: u32, position: u32) {
-    let ring = RING_ADDR.load(Ordering::Relaxed) + (position % ring::WORDS) * 4;
-    copy_words(frame + position * 4, ring, ring::CHUNK);
-}
-
-/// Fill the start of the ring from `frame`; returns how many words were copied.
-#[inline(always)]
-fn prefill_ring(frame: u32) -> u32 {
-    let mut copied = 0;
-    while copied < ring::PREFILL {
-        copy_chunk(frame, copied);
-        copied += ring::CHUNK;
-    }
-    copied
-}
-
-/// Point the (idle) scan-out DMA at the start of the ring for one frame.
-#[inline(always)]
-fn arm_scan() {
-    use pac::dma::vals::{DataSize, TreqSel};
-    let ch = pac::DMA.ch(DMA_CHANNELS[0] as usize);
-    ch.read_addr().write_value(RING_ADDR.load(Ordering::Relaxed));
-    ch.write_addr().write_value(pac::PIO1.txf(DATA_SM).as_ptr() as u32);
-    ch.trans_count().write(|w| w.set_count(FRAME_WORDS));
-    compiler_fence(Ordering::SeqCst);
-    ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(TreqSel::from(DREQ_PIO1_TX0 + DATA_SM as u8));
-        w.set_data_size(DataSize::SIZE_WORD);
-        w.set_incr_read(true);
-        w.set_incr_write(false);
-        w.set_ring_sel(false);
-        w.set_ring_size(ring::SIZE_BITS);
-        w.set_chain_to(DMA_CHANNELS[0]); // no chaining: core 1 re-arms it every frame
-        w.set_high_priority(true);
-        w.set_en(true);
-    });
-}
-
-/// Called in vertical blanking: put the data state machine and the scan-out DMA back at the
-/// first pixel of `frame`, whatever state they are in.
-#[inline(always)]
-fn restart_scan(frame: u32, data_origin: u8) -> u32 {
+fn reset_data_sm(data_origin: u8) {
     let pio = pac::PIO1;
-    let scan = DMA_CHANNELS[0];
-    let mask = 1u16 << scan;
-    pac::DMA.chan_abort().write(|w| w.set_chan_abort(mask));
-    while pac::DMA.chan_abort().read().chan_abort() & mask != 0 {}
     pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() & !(1 << DATA_SM)));
     // Toggling FJOIN_RX twice empties both FIFOs.
     let shift = pio.sm(DATA_SM).shiftctrl();
     shift.modify(|w| w.set_fjoin_rx(!w.fjoin_rx()));
     shift.modify(|w| w.set_fjoin_rx(!w.fjoin_rx()));
-    // Restart empties the OSR/ISR and keeps Y (the line length); then jump to the start, which
-    // pulls the first word. The clock divider keeps running, so the pixel phase is unchanged.
+    // Restart empties the OSR/ISR and keeps Y (the line length).
     pio.ctrl().modify(|w| w.set_sm_restart(1 << DATA_SM));
     pio.sm(DATA_SM).instr().write(|w| w.set_instr(data_origin as u16)); // jmp origin
     pio.irq().write(|w| w.set_irq(1 << LINE_IRQ));
-    let copied = prefill_ring(frame);
-    arm_scan();
     pio.fdebug().write(|w| w.set_txstall(1 << DATA_SM));
     pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() | (1 << DATA_SM)));
-    copied
 }
 
-/// How many words the ring is ahead of the scan-out right now (`u32::MAX`: no limit, e.g. the
-/// whole frame is already in the ring). Computed from the scan-out DMA's live position, because
-/// CPU writes take QSPI cycles from the copy and the margin can shrink quickly.
-fn ring_lead() -> u32 {
-    let copied = RING_COPIED.load(Ordering::Acquire);
-    if copied >= FRAME_WORDS {
-        return u32::MAX;
-    }
-    let remaining = pac::DMA.ch(DMA_CHANNELS[0] as usize).trans_count().read().count();
-    copied.saturating_sub(FRAME_WORDS - remaining)
-}
-
-/// Core 1: keep the ring ahead of the scan-out, and restart the scan-out every frame.
+/// Core 1: copy the frame into the ring and feed the ring to the data state machine, forever.
 ///
-/// Runs from SRAM, with everything it calls inlined: core 0's code evicts this loop from the
-/// XIP cache while rendering, and fetching it from flash would wait on the same QSPI bus the
-/// loop is supposed to keep busy.
+/// Runs from SRAM with everything inlined and interrupts off: it has 32 CPU cycles per word,
+/// and core 0's code evicts this loop from the XIP cache while rendering.
 #[inline(never)]
-#[unsafe(link_section = ".data.lcd_feed_ring")]
-fn feed_ring(mut copied: u32, data_origin: u8) -> ! {
-    let scan = pac::DMA.ch(DMA_CHANNELS[0] as usize);
+#[unsafe(link_section = ".data.lcd_pump")]
+fn pump(data_origin: u8) -> ! {
+    cortex_m::interrupt::disable();
     let pio = pac::PIO1;
+    let copy = pac::DMA.ch(COPY_DMA as usize);
+    let txf = pio.txf(DATA_SM).as_ptr();
+    let ring = RING_ADDR.load(Ordering::Acquire) as *mut u32;
+    let full_bit = 1 << DATA_SM;
+
     let mut frame = FRAME_ADDR.load(Ordering::Acquire);
+    // Words sent to the state machine, copy issued up to, copy completed up to (this frame).
+    let mut sent = 0u32;
+    let mut issued = 0u32;
+    let mut copied = 0u32;
+    let mut copying = false;
+    // All of this frame sent; waiting for the next frame's start (copy for it may already run).
+    let mut waiting = true;
     loop {
+        if copying && !copy.ctrl_trig().read().busy() {
+            copying = false;
+            copied = issued;
+        }
+        if !copying && issued < FRAME_WORDS && issued < sent + ring::LEAD {
+            if issued < sent {
+                // The copy fell behind; skip to where the scan-out is.
+                UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                issued = sent.next_multiple_of(ring::CHUNK);
+                copied = issued;
+            } else {
+                let dst = ring as u32 + (issued % ring::WORDS) * 4;
+                start_copy(frame + issued * 4, dst, ring::CHUNK);
+                issued += ring::CHUNK;
+                copying = true;
+            }
+        }
+        RING_LEAD.store(if copied >= FRAME_WORDS { u32::MAX } else { copied.saturating_sub(sent) }, Ordering::Relaxed);
+
         if pio.irq().read().irq() & (1 << FRAME_IRQ) != 0 {
             pio.irq().write(|w| w.set_irq(1 << FRAME_IRQ));
-            if scan.trans_count().read().count() != 0 {
+            if !waiting {
+                // Still sending the last frame: drop the rest and start over.
                 LATE_FRAMES.fetch_add(1, Ordering::Relaxed);
+                while copy.ctrl_trig().read().busy() {}
+                copying = false;
+                frame = FRAME_ADDR.load(Ordering::Acquire);
+                (sent, issued, copied) = (0, 0, 0);
             }
-            // Hold off CPU writes to PSRAM while the ring is refilled.
-            RING_COPIED.store(0, Ordering::Relaxed);
+            reset_data_sm(data_origin);
+            waiting = false;
+            continue;
+        }
+        if waiting {
+            continue;
+        }
+        // Top up the state machine's FIFO.
+        while sent < FRAME_WORDS && pio.fstat().read().txfull() & full_bit == 0 {
+            if sent == 8 {
+                // The state machine stalls by design at the start of the frame.
+                pio.fdebug().write(|w| w.set_txstall(full_bit));
+            }
+            if sent > 8 && pio.fdebug().read().txstall() & full_bit != 0 {
+                STALLS.fetch_add(1, Ordering::Relaxed);
+                pio.fdebug().write(|w| w.set_txstall(full_bit));
+            }
+            // SAFETY: in bounds; the copy DMA may be writing other words of the ring.
+            let word = unsafe { core::ptr::read_volatile(ring.add((sent % ring::WORDS) as usize)) };
+            unsafe { core::ptr::write_volatile(txf, word) };
+            sent += 1;
+        }
+        if sent == FRAME_WORDS {
+            // Frame sent. Start copying the next one during vertical blanking.
+            waiting = true;
+            while copy.ctrl_trig().read().busy() {}
+            copying = false;
             frame = FRAME_ADDR.load(Ordering::Acquire);
-            copied = restart_scan(frame, data_origin);
-            RING_COPIED.store(copied, Ordering::Release);
-            continue;
-        }
-        let stalled = pio.fdebug().read().txstall() & (1 << DATA_SM) != 0;
-        let remaining = scan.trans_count().read().count();
-        if stalled && remaining != 0 {
-            STALLS.fetch_add(1, Ordering::Relaxed);
-            pio.fdebug().write(|w| w.set_txstall(1 << DATA_SM));
-        }
-        let scanned = FRAME_WORDS - remaining;
-        if copied >= FRAME_WORDS {
-            continue; // whole frame in the ring; nothing to protect until the next restart
-        }
-        if copied <= scanned {
-            // Fell behind (e.g. flash was being written): skip ahead.
-            UNDERRUNS.fetch_add(1, Ordering::Relaxed);
-            copied = (scanned / ring::CHUNK + 1) * ring::CHUNK;
-            RING_COPIED.store(copied, Ordering::Release);
-            continue;
-        }
-        if copied < scanned + ring::LEAD {
-            copy_chunk(frame, copied);
-            copied += ring::CHUNK;
-            RING_COPIED.store(copied, Ordering::Release);
+            (sent, issued, copied) = (0, 0, 0);
         }
     }
 }
@@ -367,10 +328,11 @@ fn feed_ring(mut copied: u32, data_origin: u8) -> ! {
 ///
 /// * **SRAM** ([`FrameBuffer::take`]): 450 KiB of the 520 KiB, scanned out at 63 Hz. Little SRAM
 ///   is left for anything else.
-/// * **PSRAM** ([`FrameBuffer::in_psram`]): frees the SRAM. DMA reads PSRAM at about 40 MB/s, so
-///   scan-out runs at a 12.5 MHz dot clock (47 Hz, 25 MB/s) to leave headroom for the CPU
-///   drawing into it. Flash erase/program stalls PSRAM too, so expect a brief glitch while
-///   writing flash (do it with the backlight off).
+/// * **PSRAM** ([`FrameBuffer::in_psram`]): frees the SRAM, but uses core 1 and DMA channel 8 to
+///   feed the panel (see [`ring`]). PSRAM delivers about 40 MB/s, so scan-out runs at a
+///   12.5 MHz dot clock (47 Hz, 25 MB/s) to leave headroom for the CPU drawing into it. Draw
+///   with [`FrameBuffer::write_span`]. Flash erase/program stalls PSRAM too, so expect a brief
+///   glitch while writing flash (do it with the backlight off).
 ///
 /// Note that the RP2350's exclusive monitor only covers SRAM: atomic read-modify-write
 /// operations (e.g. `Arc`/`Rc`-style reference counts used by Slint) never complete on PSRAM, so
@@ -414,6 +376,8 @@ impl FrameBuffer {
         // program and slow the CPU down several times over.
         let uncached = psram.base_address() as usize - 0x1100_0000 + 0x1500_0000;
         let pixels = uncached as *mut Rgb565Pixel;
+        static mut RING: Ring = Ring([0; ring::WORDS as usize]);
+        RING_ADDR.store(unsafe { core::ptr::addr_of_mut!(RING.0) } as u32, Ordering::Release);
         let mut fb = FrameBuffer { pixels };
         fb.pixels_mut().fill(Rgb565Pixel(0));
         Some(fb)
@@ -444,7 +408,7 @@ impl FrameBuffer {
         }
         const BURST: usize = 32;
         for (dst, src) in dst.chunks_mut(BURST).zip(pixels.chunks(BURST)) {
-            while ring_lead() < ring::LEAD - 2 * ring::CHUNK {
+            while RING_LEAD.load(Ordering::Relaxed) < ring::LEAD / 4 * 3 {
                 core::hint::spin_loop();
             }
             dst.copy_from_slice(src);
@@ -837,17 +801,14 @@ impl<'d> St7701<'d> {
         let [px, px_rearm, lines, lines_rearm] = DMA_CHANNELS;
         let txf = |sm: usize| pac::PIO1.txf(sm).as_ptr() as u32;
         if frame_buffer.is_in_psram() {
-            // Scan out through the SRAM ring, kept filled by core 1.
-            let ring_base = unsafe { core::ptr::addr_of_mut!(RING.0) } as u32;
-            RING_ADDR.store(ring_base, Ordering::Release);
+            // Core 1 feeds the data state machine from the SRAM ring; it starts with the first
+            // full frame (the first frame stays black).
             pac::PIO1.irq().write(|w| w.set_irq(1 << FRAME_IRQ));
-            let copied = prefill_ring(frame_buffer.address());
-            arm_scan();
             let data_origin = self.origins[1];
             if let Some(core1) = self.core1.take() {
                 // SAFETY: the stack is only ever handed to core 1 once (`core1` is taken).
                 let stack = unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) };
-                spawn_core1(core1, stack, move || feed_ring(copied, data_origin));
+                spawn_core1(core1, stack, move || pump(data_origin));
             }
         } else {
             arm_loop(px, px_rearm, &FRAME_ADDR, txf(DATA_SM), FRAME_WORDS, DREQ_PIO1_TX0 + DATA_SM as u8, 0);

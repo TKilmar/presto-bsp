@@ -52,8 +52,15 @@ Pixels are ordinary little-endian RGB565, so Slint's software renderer can draw 
 the frame buffer. The 450 KiB buffer can live in either memory:
 
 - **SRAM** (`FrameBuffer::take()`): 63 Hz refresh (16.67 MHz dot clock).
-- **PSRAM** (`FrameBuffer::in_psram(&psram)`): 47 Hz refresh (12.5 MHz dot clock). DMA reads
-  PSRAM at about 40 MB/s (measured on a Presto), and this uses 25 MB/s of it.
+- **PSRAM** (`FrameBuffer::in_psram(&psram)`): 47 Hz refresh (12.5 MHz dot clock). PSRAM
+  delivers about 40 MB/s (measured on a Presto), and this uses 25 MB/s of it. Core 1 is
+  dedicated to the panel, as in Pimoroni's driver:
+  - DMA channel 8 copies the frame into a 64 KiB SRAM ring.
+  - Core 1 moves words from the ring into SM1's FIFO itself. It runs from SRAM with
+    interrupts off, so a PSRAM read stuck behind the CPU never stalls the panel.
+  - At the end of every frame core 1 resets SM1 and starts again from the first pixel.
+  - Draw with `FrameBuffer::write_span`, which waits while the ring is running low.
+  - `St7701::underruns()`, `stalls()` and `late_frames()` count glitches.
 
 Use PSRAM for the frame buffer whenever you need a heap. The RP2350 only supports atomic
 read-modify-write (exclusive load/store) in SRAM: an `Rc`/`Arc`-style counter in PSRAM spins

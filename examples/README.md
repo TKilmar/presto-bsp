@@ -114,11 +114,14 @@ Either sensor can be missing; the screen says what it cannot show.
 
 The Wi-Fi password is stored unencrypted in the last flash sector.
 
-Memory: the 450 KiB frame buffer lives in PSRAM, and core 1 streams it into a 16 KiB SRAM
-ring that the display DMA reads (PSRAM is too slow to feed the panel directly without
-glitches). The Slint heap, the Wi-Fi driver and the network buffers stay in SRAM, because the
+Memory: the 450 KiB frame buffer lives in PSRAM. Core 1 does nothing but feed the panel from
+a 64 KiB SRAM copy of the next few dozen lines (see the top-level README). The Slint heap, the Wi-Fi driver and the network buffers stay in SRAM, because the
 RP2350 cannot do atomic operations on PSRAM. The firmware stops with a clear panic if PSRAM is
 not detected.
+
+To check the display under load, build with `NURSERY_STRESS=1 ./flash.sh`. The firmware then
+redraws the whole screen continuously for 30 s. Every 10 s it logs `ring underruns`,
+`FIFO stalls` and `late frames`, which should all stay at or near 0.
 
 **If flashing with the probe fails** ("verify failed", or the probe reports mismatched command
 IDs) and the board then stays dark, unplug the Presto's USB-C for a few seconds. A reset that

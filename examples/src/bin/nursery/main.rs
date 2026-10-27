@@ -60,7 +60,7 @@ use nursery_core::settings::{InlineStr, Settings};
 use storage::Storage;
 
 /// SRAM heap for Slint and the network stack.
-const HEAP_SIZE: usize = 320 * 1024;
+const HEAP_SIZE: usize = 280 * 1024;
 /// How often a reading goes into the history.
 const RECORD_EVERY: Duration = Duration::from_secs(60);
 /// The PMSA003I needs about 30 s after power-up before its readings settle.
@@ -268,7 +268,10 @@ async fn main(spawner: Spawner) {
     board.lcd.start(&fb).unwrap();
     info!("scan-out running");
 
-    let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    // Build with NURSERY_STRESS=1 to redraw the whole screen continuously for the first 30 s
+    // (a display bandwidth test).
+    let stress = option_env!("NURSERY_STRESS").is_some();
+    let window = MinimalSoftwareWindow::new(if stress { RepaintBufferType::NewBuffer } else { RepaintBufferType::ReusedBuffer });
     slint::platform::set_platform(Box::new(PrestoPlatform { window: window.clone() })).unwrap();
     window.set_size(slint::PhysicalSize::new(DISPLAY_WIDTH as u32, DISPLAY_WIDTH as u32));
     let t = Instant::now();
@@ -500,6 +503,9 @@ async fn main(spawner: Spawner) {
         }
 
         slint::platform::update_timers_and_animations();
+        if stress && Instant::now().as_secs() < 30 {
+            window.request_redraw();
+        }
         if !app.borrow().asleep() {
             let t = Instant::now();
             let drawn = window.draw_if_needed(|renderer| {
@@ -507,7 +513,7 @@ async fn main(spawner: Spawner) {
             });
             if drawn {
                 frames += 1;
-                if frames <= 3 || frames % 100 == 0 {
+                if frames <= 3 || frames % if stress { 20 } else { 100 } == 0 {
                     info!(
                         "frame {} rendered in {} ms, heap {} KiB, ring underruns {}",
                         frames,
