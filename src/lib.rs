@@ -7,8 +7,6 @@ pub use board::*;
 
 /// LCD driver for the on-board ST7701 panel.
 pub mod lcd;
-/// PSRAM-backed display helpers.
-pub mod display;
 /// Simple PWM-based piezo speaker helper.
 pub mod speaker;
 /// FT6236 capacitive touch controller driver.

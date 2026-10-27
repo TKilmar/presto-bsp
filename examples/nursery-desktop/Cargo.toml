@@ -1,0 +1,21 @@
+[package]
+name = "nursery-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Desktop simulator for the Presto nursery display."
+
+[dependencies]
+nursery-core = { path = "../nursery-core" }
+libm = "0.2"
+png = "0.18"
+# The software renderer, so the window looks exactly like the RGB565 panel.
+slint = { version = "1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software"] }
+# Runtime inspection over MCP (SLINT_MCP_PORT=9315). Internal crate: pin to the slint version.
+i-slint-backend-selector = { version = "=1.18.1", optional = true }
+
+[features]
+mcp = ["i-slint-backend-selector/mcp"]
+
+[build-dependencies]
+slint-build = "1.18.1"

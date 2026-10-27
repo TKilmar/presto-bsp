@@ -1,0 +1,159 @@
+diff -ruN a/src/bus/mod.rs b/src/bus/mod.rs
+--- a/src/bus/mod.rs
++++ b/src/bus/mod.rs
+@@ -324,7 +324,7 @@
+     /// UART0/1 — PL011-derived UARTs at `0x4007_0000` / `0x4007_4000`
+     /// (HLD V5 §6 row 2). Indexed `[0]=UART0`, `[1]=UART1`.
+     pub(crate) uart: [UartRegs; 2],
+-    /// SPI0/1 — PL022-derived SPIs at `0x4008_0000` / `0x4008_4000`.
++    /// SPI0/1 — PL022-derived SPIs at `0x4008_0000` / `0x4008_8000`.
+     pub(crate) spi: [SpiRegs; 2],
+     /// I2C0/1 — DesignWare DW_apb_i2c at `0x4009_0000` / `0x4009_4000`.
+     pub(crate) i2c: [I2cRegs; 2],
+diff -ruN a/src/bus/peripherals.rs b/src/bus/peripherals.rs
+--- a/src/bus/peripherals.rs
++++ b/src/bus/peripherals.rs
+@@ -436,8 +436,9 @@
+     // --- QMI (0x400D0000) --- QSPI memory interface
+     pub(crate) fn qmi_read(&self, offset: u32) -> u32 {
+         match offset {
+-            // DIRECT_CSR: force TXEMPTY (bit 16) + RXEMPTY (bit 17) always set
+-            0x000 => self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17),
++            // DIRECT_CSR: no device is modelled behind the direct-mode interface, so transfers
++            // complete instantly: BUSY (bit 1) clear, TXEMPTY (bit 11) and RXEMPTY (bit 16) set.
++            0x000 => (self.qmi_regs.first().copied().unwrap_or(0) & !(1 << 1)) | (1 << 11) | (1 << 16),
+             _ => {
+                 let idx = (offset >> 2) as usize;
+                 self.qmi_regs.get(idx).copied().unwrap_or(0)
+diff -ruN a/src/core/execute_thumb32.rs b/src/core/execute_thumb32.rs
+--- a/src/core/execute_thumb32.rs
++++ b/src/core/execute_thumb32.rs
+@@ -876,6 +876,49 @@
+             self.exclusive_address = None;
+             return 2;
+         }
++        // ARMv8-M load-acquire / store-release family (LDA*, STL*, LDAEX*, STLEX*):
++        //   loads:  1110 1000 1101 Rn / Rt 1111 1 op 1111
++        //   stores: 1110 1000 1100 Rn / Rt 1111 1 op Rd   (Rd = 1111 for STL/STLB/STLH)
++        // op (hw1[6:4]): 000 byte, 001 halfword, 010 word, 100/101/110 = exclusive byte/half/word.
++        // Each core executes in order and the bus is sequentially consistent, so the ordering
++        // semantics need no extra modelling; the exclusive forms share the LDREX/STREX monitor.
++        if hw0 & 0xFFE0 == 0xE8C0 && (hw1 >> 8) & 0xF == 0xF && (hw1 >> 7) & 1 == 1 {
++            let load = hw0 & 0x10 != 0;
++            let op = (hw1 >> 4) & 0x7;
++            if matches!(op, 0 | 1 | 2 | 4 | 5 | 6) && (!load || hw1 & 0xF == 0xF || op >= 4) {
++                let rn = (hw0 & 0xF) as usize;
++                let rt = ((hw1 >> 12) & 0xF) as usize;
++                let rd = (hw1 & 0xF) as usize;
++                let addr = self.regs.r[rn];
++                let exclusive = op >= 4;
++                let size = op & 0x3;
++                if load {
++                    self.regs.r[rt] = match size {
++                        0 => self.bus_read8(addr, bus) as u32,
++                        1 => self.bus_read16(addr, bus) as u32,
++                        _ => self.bus_read32(addr, bus),
++                    };
++                    if exclusive {
++                        self.exclusive_address = Some(if size == 2 { addr } else { addr & !3 });
++                    }
++                } else {
++                    let monitor = if size == 2 { addr } else { addr & !3 };
++                    let allowed = !exclusive || self.exclusive_address == Some(monitor);
++                    if allowed {
++                        match size {
++                            0 => self.bus_write8(addr, self.regs.r[rt] as u8, bus),
++                            1 => self.bus_write16(addr, self.regs.r[rt] as u16, bus),
++                            _ => self.bus_write32(addr, self.regs.r[rt], bus),
++                        }
++                    }
++                    if exclusive {
++                        self.regs.r[rd] = if allowed { 0 } else { 1 };
++                        self.exclusive_address = None;
++                    }
++                }
++                return 2;
++            }
++        }
+         // (Falls through to LDRD/STRD for any other unrecognized pattern)
+ 
+         // LDRD/STRD (immediate): default path
+diff -ruN a/src/dma.rs b/src/dma.rs
+--- a/src/dma.rs
++++ b/src/dma.rs
+@@ -700,10 +700,15 @@
+         if (ch.ctrl & CTRL_EN) == 0 {
+             return;
+         }
++        // Silicon copies the last value written to TRANS_COUNT into the live counter on every
++        // trigger of an idle channel, whichever alias triggered it. This is what lets a second
++        // channel restart this one by writing only its READ_ADDR_TRIG.
++        if !ch.busy {
++            ch.trans_count = ch.trans_count_reload;
++        }
+         if ch.trans_count == 0 {
+             return;
+         }
+-        ch.trans_count_reload = ch.trans_count;
+         ch.busy = true;
+     }
+ 
+diff -ruN a/src/peripherals/spi.rs b/src/peripherals/spi.rs
+--- a/src/peripherals/spi.rs
++++ b/src/peripherals/spi.rs
+@@ -1,7 +1,7 @@
+ //! RP2350 SPI peripheral (PL022-derived; datasheet §12.2).
+ //!
+ //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
+-//! SPI0 lives at `0x4008_0000`, SPI1 at `0x4008_4000`.
++//! SPI0 lives at `0x4008_0000`, SPI1 at `0x4008_8000`.
+ //!
+ //! Mirrors the RP2040 SPI (`rp2040_emu::peripherals::spi`) verbatim. The
+ //! only RP2350 deltas are the NVIC IRQ number ([`crate::irq::IRQ_SPI0_IRQ`]
+@@ -41,7 +41,7 @@
+ /// SPI0 base (RP2350 datasheet §12.2).
+ pub const SPI0_BASE: u32 = 0x4008_0000;
+ /// SPI1 base (RP2350 datasheet §12.2, 4 KB stride).
+-pub const SPI1_BASE: u32 = 0x4008_4000;
++pub const SPI1_BASE: u32 = 0x4008_8000;
+ 
+ /// Offset: `SSPCR0` — frame format / clock rate.
+ pub const SSPCR0: u32 = 0x000;
+@@ -386,8 +386,11 @@
+             // In loopback mode the PL022 shift register ties TX out
+             // back to RX in -- the popped word appears in the RX FIFO
+             // after one word-time, matching silicon's baud-timed path.
+-            if self.is_loopback() && self.rx_fifo.len() < SSP_FIFO_DEPTH {
+-                self.rx_fifo.push_back(word);
++            // Every frame shifted out shifts one in: in loopback mode it is the TX word, otherwise
++            // whatever is on the RX pin (no device is modelled, so all zeros).
++            let received = if self.is_loopback() { word } else { 0 };
++            if self.rx_fifo.len() < SSP_FIFO_DEPTH {
++                self.rx_fifo.push_back(received);
+             }
+         }
+         self.refresh_tx_rx_interrupts();
+diff -ruN a/src/threaded/bus.rs b/src/threaded/bus.rs
+--- a/src/threaded/bus.rs
++++ b/src/threaded/bus.rs
+@@ -2086,7 +2086,7 @@
+             let shared = fresh_shared();
+             // SPI1 is held in reset post-bootrom. A write there must not
+             // panic and must not affect the RESETS state.
+-            let spi1_base: u32 = 0x4008_4000;
++            let spi1_base: u32 = 0x4008_8000;
+             let mut bus = WorkerBus::new(0, shared.clone());
+             bus.write32(spi1_base + 0x10, 0xDEAD_BEEF, 0);
+             // Readback also returns 0 via the held-guard.
+diff -ruN a/src/threaded/peripherals.rs b/src/threaded/peripherals.rs
+--- a/src/threaded/peripherals.rs
++++ b/src/threaded/peripherals.rs
+@@ -449,7 +449,7 @@
+ pub struct ApbState {
+     /// UART0/UART1 — PL011-derived UART at 0x4007_0000 / 0x4007_4000.
+     pub uart: [UartRegs; 2],
+-    /// SPI0/SPI1 — PL022-derived SPI at 0x4008_0000 / 0x4008_4000.
++    /// SPI0/SPI1 — PL022-derived SPI at 0x4008_0000 / 0x4008_8000.
+     pub spi: [SpiRegs; 2],
+     /// I2C0/I2C1 — DesignWare DW_apb_i2c at 0x4009_0000 / 0x4009_4000.
+     pub i2c: [I2cRegs; 2],

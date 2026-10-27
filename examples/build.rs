@@ -13,6 +13,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+include!("nursery/version.rs");
+
 fn main() {
     // Put `memory.x` in our output directory and ensure it's
     // on the linker search path.
@@ -32,4 +34,14 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
+
+    export_git_version();
+
+    // The nursery UI. Fonts and images are pre-rendered for the software renderer.
+    slint_build::compile_with_config(
+        "nursery/ui/nursery.slint",
+        slint_build::CompilerConfiguration::new()
+            .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer),
+    )
+    .unwrap();
 }

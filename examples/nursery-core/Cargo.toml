@@ -1,0 +1,12 @@
+[package]
+name = "nursery-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Platform-independent logic for the nursery display: sensor history, air quality, baby sleepwear recommendations."
+
+[dependencies]
+libm = "0.2"
+heapless = { version = "0.9", features = ["serde"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.7", default-features = false }

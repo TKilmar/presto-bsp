@@ -1,0 +1,221 @@
+// Desktop-only controls for trying the nursery screen with different conditions.
+import { Slider, CheckBox, Button, GroupBox, ScrollView } from "std-widgets.slint";
+import { NurseryScreen, Bar, Recommendation, Morning, Evening, SettingsState, WifiNetwork, AboutRow, TextOps } from "../../nursery/ui/nursery.slint";
+
+export { NurseryScreen, Bar, Recommendation, Morning, Evening, SettingsState, WifiNetwork, AboutRow, TextOps }
+
+export struct Scenario {
+    // Minutes since midnight.
+    time: float,
+    room: float,
+    humidity: float,
+    pm25: float,
+    // Last night.
+    night-start: float,
+    night-drop: float,
+    night-pm: float,
+    night-spike: bool,
+    // Forecast.
+    has-forecast: bool,
+    outdoor-low: float,
+    rain-chance: float,
+    rain-hour: float,
+    // Sensors present.
+    has-temp: bool,
+    has-pm: bool,
+    // Seconds until the screen sleeps.
+    timeout: float,
+}
+
+component Row inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in-out property <float> current <=> slider.value;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <float> step: 1;
+    callback changed();
+    spacing: 8px;
+    Text {
+        text: root.label;
+        width: 130px;
+        vertical-alignment: center;
+    }
+    slider := Slider {
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        changed => { root.changed(); }
+    }
+    Text {
+        text: root.value;
+        width: 70px;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+    }
+}
+
+export component SimControls inherits Window {
+    title: "Nursery simulator controls";
+    preferred-width: 460px;
+    preferred-height: 760px;
+
+    in-out property <Scenario> scenario: {
+        time: 20 * 60, room: 21.5, humidity: 48, pm25: 4,
+        night-start: 21, night-drop: 2.5, night-pm: 5, night-spike: false,
+        has-forecast: true, outdoor-low: 6, rain-chance: 70, rain-hour: 14,
+        has-temp: true, has-pm: true, timeout: 180,
+    };
+    callback changed();
+    callback touch-screen();
+    callback screenshot();
+
+    pure function hm(minutes: float) -> string {
+        let h = floor(minutes / 60);
+        let m = mod(floor(minutes), 60);
+        (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m
+    }
+
+    ScrollView {
+        VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+
+            GroupBox {
+                title: "Now";
+                VerticalLayout {
+                    spacing: 4px;
+                    Row {
+                        label: "Time of day";
+                        minimum: 0; maximum: 1439; step: 10;
+                        current <=> root.scenario.time;
+                        value: root.hm(root.scenario.time);
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "Room";
+                        minimum: 10; maximum: 32; step: 0.1;
+                        current <=> root.scenario.room;
+                        value: round(root.scenario.room * 10) / 10 + " °C";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "Humidity";
+                        minimum: 20; maximum: 90;
+                        current <=> root.scenario.humidity;
+                        value: round(root.scenario.humidity) + " %";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "PM2.5";
+                        minimum: 0; maximum: 150;
+                        current <=> root.scenario.pm25;
+                        value: round(root.scenario.pm25) + " µg/m³";
+                        changed => { root.changed(); }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Last night (history)";
+                VerticalLayout {
+                    spacing: 4px;
+                    Row {
+                        label: "Room at 19:00";
+                        minimum: 10; maximum: 32; step: 0.1;
+                        current <=> root.scenario.night-start;
+                        value: round(root.scenario.night-start * 10) / 10 + " °C";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "Overnight drop";
+                        minimum: 0; maximum: 8; step: 0.1;
+                        current <=> root.scenario.night-drop;
+                        value: round(root.scenario.night-drop * 10) / 10 + " °C";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "PM2.5";
+                        minimum: 0; maximum: 100;
+                        current <=> root.scenario.night-pm;
+                        value: round(root.scenario.night-pm) + " µg/m³";
+                        changed => { root.changed(); }
+                    }
+                    CheckBox {
+                        text: "Smoke spike at 23:00";
+                        checked <=> root.scenario.night-spike;
+                        toggled => { root.changed(); }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Forecast";
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Forecast available (needs Wi-Fi on the device)";
+                        checked <=> root.scenario.has-forecast;
+                        toggled => { root.changed(); }
+                    }
+                    Row {
+                        label: "Outdoor low";
+                        minimum: -15; maximum: 28;
+                        current <=> root.scenario.outdoor-low;
+                        value: round(root.scenario.outdoor-low) + " °C";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "Rain chance";
+                        minimum: 0; maximum: 100; step: 5;
+                        current <=> root.scenario.rain-chance;
+                        value: round(root.scenario.rain-chance) + " %";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "Rain from";
+                        minimum: 0; maximum: 23;
+                        current <=> root.scenario.rain-hour;
+                        value: root.hm(round(root.scenario.rain-hour) * 60);
+                        changed => { root.changed(); }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Device";
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Temperature sensor (SHT4x)";
+                        checked <=> root.scenario.has-temp;
+                        toggled => { root.changed(); }
+                    }
+                    CheckBox {
+                        text: "PM2.5 sensor (PMSA003I)";
+                        checked <=> root.scenario.has-pm;
+                        toggled => { root.changed(); }
+                    }
+                    Row {
+                        label: "Screen timeout";
+                        minimum: 5; maximum: 600; step: 5;
+                        current <=> root.scenario.timeout;
+                        value: round(root.scenario.timeout) + " s";
+                        changed => { root.changed(); }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: "Touch screen";
+                            clicked => { root.touch-screen(); }
+                        }
+                        Button {
+                            text: "Save screenshot";
+                            clicked => { root.screenshot(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

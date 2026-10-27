@@ -1,0 +1,3 @@
+[build]
+# Pure logic: build and test on the host (cargo test).
+target = "host-tuple"

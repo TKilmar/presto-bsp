@@ -1,0 +1,3 @@
+[build]
+# The desktop simulator runs on the host, not the RP2350.
+target = "host-tuple"

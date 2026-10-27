@@ -91,9 +91,9 @@ impl<E> From<E> for TouchError<E> {
 pub struct TouchPoint {
     /// Finger identifier reported by the controller.
     pub id: u8,
-    /// X coordinate (scaled if requested).
+    /// X coordinate in pixels.
     pub x: u16,
-    /// Y coordinate (scaled if requested).
+    /// Y coordinate in pixels.
     pub y: u16,
     /// Whether the finger is currently active.
     pub active: bool,
@@ -112,25 +112,32 @@ pub struct TouchReport {
 }
 
 /// FT6236 driver.
-pub struct Ft6236<I2C, PINT> {
+///
+/// Coordinates are reported in the panel's native 480x480 space.
+pub struct Ft6236<I2C, PINT, RST = ()> {
     i2c: I2C,
     pin_int: PINT,
-    scale: u16,
+    _reset: RST,
 }
 
-impl<I2C, PINT, E> Ft6236<I2C, PINT>
+impl<I2C, PINT, RST, E> Ft6236<I2C, PINT, RST>
 where
     I2C: I2c<SevenBitAddress, Error = E>,
     PINT: Wait + embedded_hal::digital::InputPin,
 {
-    /// Create a new driver. Set `full_res` to `true` to keep the native 240x240 coordinate space,
-    /// or `false` to scale down by 2 (matching the MicroPython example).
-    pub fn new(bus: I2C, interrupt_pin: PINT, full_res: bool) -> Self {
+    /// Create a new driver. `reset` is held for the driver's lifetime (pass the reset pin
+    /// driven high, or `()` if it is not connected).
+    pub fn new(bus: I2C, interrupt_pin: PINT, reset: RST) -> Self {
         Self {
             i2c: bus,
             pin_int: interrupt_pin,
-            scale: if full_res { 1 } else { 2 },
+            _reset: reset,
         }
+    }
+
+    /// Wait until the controller signals new data (interrupt pin low).
+    pub async fn wait_for_touch(&mut self) -> Result<(), TouchError<E>> {
+        self.pin_int.wait_for_low().await.map_err(|_| TouchError::Pin)
     }
 
     /// Wait for the interrupt pin to fall, then read the latest touch report.
@@ -157,8 +164,8 @@ where
         for n in 0..touches.min(2) {
             let offset = 3 + (n as usize) * 6;
             let event = TouchEventCode::from(buf[offset] >> 6);
-            let x = (((buf[offset] & 0x0f) as u16) << 8 | buf[offset + 1] as u16) / self.scale;
-            let y = (((buf[offset + 2] & 0x0f) as u16) << 8 | buf[offset + 3] as u16) / self.scale;
+            let x = ((buf[offset] & 0x0f) as u16) << 8 | buf[offset + 1] as u16;
+            let y = ((buf[offset + 2] & 0x0f) as u16) << 8 | buf[offset + 3] as u16;
             let id = buf[offset + 2] >> 4;
 
             points[n as usize] = Some(TouchPoint {

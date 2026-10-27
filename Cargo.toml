@@ -1,33 +1,32 @@
 [package]
 name = "presto-bsp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Embassy-based board support package for the Pimoroni Presto (RP2350)"
 license = "MIT"
 keywords = ["embedded", "async", "rp2350", "raspberry-pi", "pimoroni"]
 categories = ["embedded", "hardware-support", "no-std", "asynchronous"]
 repository = "https://github.com/kilmart/presto-bsp"
+exclude = ["emu", "pico_presto_schematic.pdf"]
 
 [dependencies]
-embassy-rp = { version = "0.9.0", features = [
+embassy-rp = { version = "0.10.0", features = [
     "rp235xb",
     "time-driver",
     "unstable-pac",
     "critical-section-impl",
     "binary-info",
-    "defmt",
 ] }
-embassy-time = { version = "0.5.0" }
-embassy-sync = { version = "0.7.2" }
-cortex-m = { version = "0.7.6" }
+embassy-time = { version = "0.5.1" }
+embassy-sync = { version = "0.8.0" }
+cortex-m = { version = "0.7.7" }
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 critical-section = "1.2.0"
-embassy-hal-internal = { version = "0.3.0", features = ["cortex-m", "prio-bits-2"] }
 fixed = "1.29.0"
-slint = { version = "1.14.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
+slint = { version = "1.18.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
 
-defmt = { version = "^1.0.1", optional = true }
+defmt = { version = "1.1.1", optional = true }
 
 [features]
 default = ["defmt"]
@@ -37,6 +36,3 @@ defmt = [
     "embassy-time/defmt",
     "embassy-time/defmt-timestamp-uptime",
 ]
-
-[build-dependencies]
-slint-build = "1.14"

@@ -7,8 +7,8 @@
         {
             "type": "probe-rs-debug",
             "request": "launch",
-            "name": "probe-rs Test",
-            "cwd": "${workspaceFolder}/playground",
+            "name": "probe-rs nursery",
+            "cwd": "${workspaceFolder}/examples",
             "connectUnderReset": false,
             "chip": "RP235X",
             "flashingConfig": {
@@ -18,7 +18,7 @@
             "coreConfigs": [
                 {
                     "coreIndex": 0,
-                    "programBinary": "target/thumbv8m.main-none-eabihf/debug/presto-speaker-example",
+                    "programBinary": "target/thumbv8m.main-none-eabihf/release/nursery",
                     "rttEnabled": true
                 }
             ]

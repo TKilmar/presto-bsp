@@ -1,0 +1,1465 @@
+// Nursery display for the Pimoroni Presto (480x480).
+//
+// Morning: last night's room temperature and air quality, what the night called for, and
+// whether it will rain today. Evening: the room now, the expected overnight low, and what the
+// baby should wear. All values arrive pre-formatted from Rust (nursery/bridge.rs); this file only
+// lays them out.
+
+import "fonts/DejaVuSans.ttf";
+
+export struct Bar {
+    // Bar height, 0..1.
+    level: float,
+    // Colour index into the palette used by the chart (temperature comfort or air quality).
+    tone: int,
+    // No data for this slot.
+    empty: bool,
+}
+
+export struct Recommendation {
+    // False when there is no temperature to base a recommendation on.
+    valid: bool,
+    // Shown instead when not valid.
+    missing: string,
+    // 0 nappy only, 1 short-sleeve bodysuit, 2 long-sleeve bodysuit, 3 + footed sleepsuit,
+    // 4 footed sleepsuit without bodysuit.
+    outfit: int,
+    // Bodysuit the user skipped, drawn as a dotted outline: 0 none, 1 short, 2 long sleeve,
+    // 3 hidden under the sleepsuit.
+    ghost: int,
+    // The outfit has (or had) a bodysuit, so tapping the baby can toggle it.
+    can-toggle-bodysuit: bool,
+    outfit-label: string,
+    // e.g. "2.5".
+    bag-tog: string,
+    // 0..4 for 0.2, 0.5, 1.0, 2.5, 3.5 TOG.
+    bag-index: int,
+    // e.g. "≈ 2.8 TOG in total".
+    total: string,
+    advice: string,
+    // 0 cold, 1 ideal, 2 warm, 3 hot.
+    comfort: int,
+}
+
+export struct Morning {
+    has-data: bool,
+    // e.g. "No readings last night" when has-data is false.
+    note: string,
+    temp-range: string,
+    temp-detail: string,
+    temp-bars: [Bar],
+    air-label: string,
+    air-level: int,
+    air-detail: string,
+    air-bars: [Bar],
+    // What the coolest part of the night called for.
+    called-for: string,
+    recommendation: Recommendation,
+    // 0 dry, 1 showers possible, 2 rain likely, -1 no forecast.
+    rain-level: int,
+    rain-title: string,
+    rain-detail: string,
+}
+
+export struct Evening {
+    room-now: string,
+    room-comfort: int,
+    humidity: string,
+    air-label: string,
+    air-level: int,
+    air-detail: string,
+    expected-low: string,
+    // Next to the low, e.g. "2° colder outside".
+    outdoor-note: string,
+    expected-detail: string,
+    plan-bars: [Bar],
+    dress-for: string,
+    recommendation: Recommendation,
+    rain-level: int,
+    rain-title: string,
+    rain-detail: string,
+}
+
+export struct WifiNetwork {
+    ssid: string,
+    // Signal strength 0..3.
+    bars: int,
+    secure: bool,
+    connected: bool,
+}
+
+export struct AboutRow {
+    label: string,
+    value: string,
+}
+
+export struct SettingsState {
+    // 10..100 in steps of 10.
+    brightness: int,
+    // -2 (runs cool) .. 2 (runs warm).
+    sensitivity: int,
+    sensitivity-label: string,
+    sensitivity-explanation: string,
+    // What tonight's plan recommends with the current sensitivity.
+    sensitivity-preview: string,
+    wifi-enabled: bool,
+    // One line, e.g. "Connected to Home · 192.168.1.20".
+    wifi-status: string,
+    // Short form for the tile, e.g. "Home" or "Off".
+    wifi-summary: string,
+    wifi-busy: bool,
+    networks: [WifiNetwork],
+    version: string,
+    about: [AboutRow],
+}
+
+// String helpers the .slint language lacks; implemented in Rust (see app.rs).
+export global TextOps {
+    // `text` without its last character.
+    pure callback drop-last(string) -> string;
+    // One bullet per character of `text`.
+    pure callback mask(string) -> string;
+}
+
+global Palette {
+    out property <color> background: #15131d;
+    out property <color> card: #221f2d;
+    out property <color> card-raised: #2b2739;
+    out property <color> text: #f4eee6;
+    out property <color> muted: #a39cb0;
+    out property <color> faint: #3a3548;
+    out property <color> accent: #f2b05e;
+
+    // Room comfort: cold, ideal, warm, hot.
+    public pure function comfort(index: int) -> color {
+        index == 0 ? #6fa8ff : index == 1 ? #82c98a : index == 2 ? #f2b05e : #ef7a5d
+    }
+
+    // PM2.5 category: good .. hazardous.
+    public pure function air(level: int) -> color {
+        level == 0 ? #82c98a : level == 1 ? #e8c867 : level == 2 ? #f4a261 : level == 3 ? #ef6f5d : level == 4 ? #b07ce8 : #a2355d
+    }
+
+    // Thermal sensitivity steps, cool (0) to warm (4).
+    public pure function step(index: int) -> color {
+        index <= 0 ? #6fa8ff : index == 1 ? #9cc4f5 : index == 2 ? #82c98a : index == 3 ? #f2b05e : #ef7a5d
+    }
+
+    // Sleeping bag colour by TOG (0.2 .. 3.5): warmer bags are deeper and cooler-toned.
+    public pure function bag(index: int) -> color {
+        index == 0 ? #f6e7a8 : index == 1 ? #bfe5a9 : index == 2 ? #8fd6c8 : index == 3 ? #8fb4f2 : #b49af0
+    }
+}
+
+component Card inherits Rectangle {
+    background: Palette.card;
+    border-radius: 16px;
+}
+
+component Caption inherits Text {
+    color: Palette.muted;
+    font-size: 13px;
+}
+
+component Chip inherits Rectangle {
+    in property <string> label;
+    in property <color> tone;
+    height: 24px;
+    width: chip-text.preferred-width + 20px;
+    border-radius: 12px;
+    background: tone.with-alpha(0.18);
+    chip-text := Text {
+        text: root.label;
+        color: root.tone;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+}
+
+// Twelve bars, one per hour of the night.
+component BarChart inherits Rectangle {
+    in property <[Bar]> bars;
+    // 0 = colour by comfort, 1 = colour by air quality.
+    in property <int> scheme;
+    in property <[string]> axis;
+
+    VerticalLayout {
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 3px;
+            for bar in root.bars: Rectangle {
+                Rectangle {
+                    y: parent.height - self.height;
+                    height: bar.empty ? 2px : max(4px, parent.height * bar.level);
+                    border-radius: 2px;
+                    background: bar.empty ? Palette.faint
+                        : root.scheme == 0 ? Palette.comfort(bar.tone) : Palette.air(bar.tone);
+                }
+            }
+        }
+        HorizontalLayout {
+            height: 14px;
+            for label[i] in root.axis: Text {
+                text: label;
+                color: Palette.muted;
+                font-size: 11px;
+                horizontal-alignment: i == 0 ? left : i == root.axis.length - 1 ? right : center;
+            }
+        }
+    }
+}
+
+// Baby in the recommended clothes next to the sleeping bag.
+component Outfit inherits Rectangle {
+    in property <Recommendation> recommendation;
+    // Tap on the baby: sleeping without a bodysuit, or back with one.
+    callback toggle-bodysuit();
+
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: center;
+        Rectangle {
+            width: 96px;
+            height: 128px;
+            Image {
+                y: 0px;
+                width: parent.width;
+                height: 116px;
+                source: root.recommendation.outfit == 0 ? @image-url("img/outfit-0.svg")
+                    : root.recommendation.outfit == 1 ? @image-url("img/outfit-1.svg")
+                    : root.recommendation.outfit == 2 ? @image-url("img/outfit-2.svg")
+                    : @image-url("img/outfit-3.svg");
+            }
+            // The skipped bodysuit, faded and dotted.
+            if root.recommendation.ghost == 1 || root.recommendation.ghost == 2: Image {
+                y: 0px;
+                width: parent.width;
+                height: 116px;
+                source: root.recommendation.ghost == 1 ? @image-url("img/bodysuit-ghost-1.svg")
+                    : @image-url("img/bodysuit-ghost-2.svg");
+            }
+            if root.recommendation.can-toggle-bodysuit: Text {
+                y: 116px;
+                width: parent.width;
+                horizontal-alignment: center;
+                text: root.recommendation.ghost > 0 ? "tap: add bodysuit" : "tap: no bodysuit";
+                color: root.recommendation.ghost > 0 ? Palette.accent : Palette.muted;
+                font-size: 10px;
+            }
+            if root.recommendation.can-toggle-bodysuit: TouchArea {
+                clicked => { root.toggle-bodysuit(); }
+            }
+        }
+        Rectangle {
+            width: 80px;
+            height: 128px;
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: @image-url("img/sleepbag.svg");
+                colorize: Palette.bag(root.recommendation.bag-index);
+            }
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: @image-url("img/sleepbag-detail.svg");
+            }
+            Text {
+                y: 52px;
+                width: parent.width;
+                horizontal-alignment: center;
+                text: root.recommendation.bag-tog;
+                font-size: 22px;
+                color: #2a2433;
+            }
+            Text {
+                y: 78px;
+                width: parent.width;
+                horizontal-alignment: center;
+                text: "TOG";
+                font-size: 11px;
+                color: #2a2433;
+            }
+        }
+    }
+}
+
+component RecommendationText inherits VerticalLayout {
+    in property <string> heading;
+    in property <Recommendation> recommendation;
+    spacing: 3px;
+    alignment: center;
+    Caption { text: root.heading; }
+    Text {
+        text: root.recommendation.bag-tog + " TOG sleeping bag";
+        color: Palette.text;
+        font-size: 20px;
+        wrap: word-wrap;
+    }
+    Text {
+        text: root.recommendation.outfit-label;
+        color: Palette.text;
+        font-size: 15px;
+        wrap: word-wrap;
+    }
+    Caption { text: root.recommendation.total; }
+    Rectangle { height: 4px; }
+    Text {
+        text: root.recommendation.advice;
+        color: Palette.comfort(root.recommendation.comfort);
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}
+
+component RecommendationCard inherits Card {
+    in property <string> heading;
+    in property <Recommendation> recommendation;
+    callback toggle-bodysuit();
+    if root.recommendation.valid: HorizontalLayout {
+        padding: 10px;
+        padding-left: 4px;
+        spacing: 8px;
+        Outfit {
+            width: 186px;
+            recommendation: root.recommendation;
+            toggle-bodysuit => { root.toggle-bodysuit(); }
+        }
+        RecommendationText {
+            heading: root.heading;
+            recommendation: root.recommendation;
+        }
+    }
+    if !root.recommendation.valid: Text {
+        width: parent.width - 40px;
+        text: root.recommendation.missing;
+        color: Palette.muted;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+component RainRow inherits Card {
+    in property <int> level;
+    in property <string> title;
+    in property <string> detail;
+    HorizontalLayout {
+        padding: 8px;
+        padding-left: 14px;
+        spacing: 12px;
+        Image {
+            width: 40px;
+            height: 40px;
+            y: (parent.height - self.height) / 2;
+            source: root.level == 2 ? @image-url("img/weather-2.svg")
+                : root.level == 1 ? @image-url("img/weather-1.svg")
+                : @image-url("img/weather-0.svg");
+            colorize: root.level == 2 ? #7fb2ff : root.level == 1 ? #a9c4ec : root.level == 0 ? Palette.accent : Palette.faint;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                color: Palette.text;
+                font-size: 17px;
+            }
+            Caption { text: root.detail; }
+        }
+    }
+}
+
+component Header inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> clock;
+    // 0 sun, 1 moon, 2 gear.
+    in property <int> icon;
+    callback clock-clicked();
+    height: 56px;
+
+    HorizontalLayout {
+        Rectangle {
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Image {
+                        width: 22px;
+                        height: 22px;
+                        y: 4px;
+                        source: root.icon == 1 ? @image-url("img/moon.svg")
+                            : root.icon == 2 ? @image-url("img/gear.svg")
+                            : @image-url("img/sun.svg");
+                        colorize: Palette.accent;
+                    }
+                    Text {
+                        text: root.title;
+                        color: Palette.text;
+                        font-size: 24px;
+                    }
+                }
+                Caption { text: root.subtitle; }
+            }
+        }
+        Text {
+            text: root.clock;
+            color: Palette.text;
+            font-size: 30px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            TouchArea {
+                clicked => { root.clock-clicked(); }
+            }
+        }
+    }
+}
+
+component MorningView inherits VerticalLayout {
+    callback toggle-bodysuit();
+    in property <Morning> data;
+    in property <string> clock;
+    callback clock-clicked();
+    spacing: 10px;
+
+    Header {
+        title: "Good morning";
+        subtitle: "Last night · 19:00 – 07:00";
+        clock: root.clock;
+        icon: 0;
+        clock-clicked => { root.clock-clicked(); }
+    }
+
+    if !root.data.has-data: Card {
+        vertical-stretch: 1;
+        Text {
+            text: root.data.note;
+            color: Palette.muted;
+            font-size: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            width: parent.width - 40px;
+        }
+    }
+
+    if root.data.has-data: HorizontalLayout {
+        spacing: 10px;
+        height: 142px;
+        Card {
+            width: (parent.width - 10px) / 2;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+                Caption { text: "Room temperature"; }
+                Text {
+                    text: root.data.temp-range;
+                    color: Palette.text;
+                    font-size: 22px;
+                }
+                Caption { text: root.data.temp-detail; }
+                BarChart {
+                    vertical-stretch: 1;
+                    bars: root.data.temp-bars;
+                    scheme: 0;
+                    axis: ["19", "01", "07"];
+                }
+            }
+        }
+        Card {
+            width: (parent.width - 10px) / 2;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+                Caption { text: "Air · PM2.5 µg/m³"; }
+                Chip {
+                    label: root.data.air-label;
+                    tone: Palette.air(root.data.air-level);
+                }
+                Caption { text: root.data.air-detail; }
+                BarChart {
+                    vertical-stretch: 1;
+                    bars: root.data.air-bars;
+                    scheme: 1;
+                    axis: ["19", "01", "07"];
+                }
+            }
+        }
+    }
+
+    if root.data.has-data: RecommendationCard {
+        vertical-stretch: 1;
+        heading: root.data.called-for;
+        recommendation: root.data.recommendation;
+        toggle-bodysuit => { root.toggle-bodysuit(); }
+    }
+
+    RainRow {
+        height: 62px;
+        level: root.data.rain-level;
+        title: root.data.rain-title;
+        detail: root.data.rain-detail;
+    }
+}
+
+component EveningView inherits VerticalLayout {
+    callback toggle-bodysuit();
+    in property <Evening> data;
+    in property <string> clock;
+    callback clock-clicked();
+    spacing: 10px;
+
+    Header {
+        title: "Tonight";
+        subtitle: "Plan for 19:00 – 07:00";
+        clock: root.clock;
+        icon: 1;
+        clock-clicked => { root.clock-clicked(); }
+    }
+
+    HorizontalLayout {
+        spacing: 10px;
+        height: 142px;
+        Card {
+            width: 170px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+                Caption { text: "Room now"; }
+                Text {
+                    text: root.data.room-now;
+                    color: root.data.room-comfort < 0 ? Palette.muted : Palette.comfort(root.data.room-comfort);
+                    font-size: 32px;
+                }
+                Caption { text: root.data.humidity; }
+                Rectangle { height: 4px; }
+                Chip {
+                    label: root.data.air-label;
+                    tone: Palette.air(root.data.air-level);
+                }
+                Caption { text: root.data.air-detail; }
+            }
+        }
+        Card {
+            width: parent.width - 180px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+                Caption { text: "Expected overnight low"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.data.expected-low;
+                        color: Palette.text;
+                        font-size: 22px;
+                    }
+                    Caption {
+                        text: root.data.outdoor-note;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                }
+                Caption {
+                    text: root.data.expected-detail;
+                    overflow: elide;
+                }
+                BarChart {
+                    vertical-stretch: 1;
+                    bars: root.data.plan-bars;
+                    scheme: 0;
+                    axis: ["19", "01", "07"];
+                }
+            }
+        }
+    }
+
+    RecommendationCard {
+        vertical-stretch: 1;
+        heading: root.data.dress-for;
+        recommendation: root.data.recommendation;
+        toggle-bodysuit => { root.toggle-bodysuit(); }
+    }
+
+    RainRow {
+        height: 62px;
+        level: root.data.rain-level;
+        title: root.data.rain-title;
+        detail: root.data.rain-detail;
+    }
+}
+
+// Set the time of day (the Presto has no battery-backed clock).
+component ClockEditor inherits Rectangle {
+    in property <string> clock;
+    callback adjust(int /* minutes */);
+    callback done();
+    background: #000000c0;
+
+    TouchArea { }  // swallow clicks behind the dialog
+
+    Card {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 340px;
+        height: 230px;
+        background: Palette.card-raised;
+        VerticalLayout {
+            padding: 18px;
+            spacing: 14px;
+            Caption {
+                text: "Set the time";
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.clock;
+                color: Palette.text;
+                font-size: 44px;
+                horizontal-alignment: center;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                for step in [-60, -10, -1, 1, 10, 60]: Rectangle {
+                    height: 40px;
+                    border-radius: 10px;
+                    background: touch.pressed ? Palette.accent.with-alpha(0.4) : Palette.faint;
+                    Text {
+                        text: (step > 0 ? "+" : "−") + (abs(step) == 60 ? "1h" : abs(step) + "m");
+                        color: Palette.text;
+                        font-size: 14px;
+                    }
+                    touch := TouchArea {
+                        clicked => { root.adjust(step); }
+                    }
+                }
+            }
+            Rectangle {
+                height: 40px;
+                border-radius: 10px;
+                background: done-touch.pressed ? Palette.accent.darker(0.2) : Palette.accent;
+                Text {
+                    text: "Done";
+                    color: #2a2433;
+                    font-size: 16px;
+                }
+                done-touch := TouchArea {
+                    clicked => { root.done(); }
+                }
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------
+
+component Button inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    in property <length> font-size: 16px;
+    callback clicked();
+    height: 44px;
+    border-radius: 12px;
+    background: !root.enabled ? Palette.faint.with-alpha(0.5)
+        : root.primary ? (touch.pressed ? Palette.accent.darker(0.2) : Palette.accent)
+        : (touch.pressed ? Palette.accent.with-alpha(0.35) : Palette.faint);
+    Text {
+        text: root.text;
+        color: root.primary && root.enabled ? #2a2433 : root.enabled ? Palette.text : Palette.muted;
+        font-size: root.font-size;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> on;
+    callback toggled(bool);
+    width: 64px;
+    height: 36px;
+    border-radius: 18px;
+    background: root.on ? Palette.accent : Palette.faint;
+    Rectangle {
+        x: root.on ? parent.width - self.width - 4px : 4px;
+        y: 4px;
+        width: 28px;
+        height: 28px;
+        border-radius: 14px;
+        background: root.on ? #2a2433 : Palette.muted;
+        animate x { duration: 120ms; }
+    }
+    TouchArea {
+        clicked => { root.toggled(!root.on); }
+    }
+}
+
+component Tile inherits Rectangle {
+    in property <image> icon;
+    in property <color> tone;
+    in property <string> title;
+    in property <string> status;
+    callback clicked();
+    border-radius: 18px;
+    background: touch.pressed ? Palette.card-raised : Palette.card;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 6px;
+        alignment: center;
+        Image {
+            height: 52px;
+            source: root.icon;
+            colorize: root.tone;
+            image-fit: contain;
+        }
+        Text {
+            text: root.title;
+            color: Palette.text;
+            font-size: 19px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.status;
+            color: Palette.muted;
+            font-size: 13px;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Full-page panel with a back button.
+component Panel inherits Rectangle {
+    in property <string> title;
+    callback back();
+    background: Palette.background;
+    TouchArea { }  // keep touches from reaching the page underneath
+    VerticalLayout {
+        spacing: 10px;
+        HorizontalLayout {
+            height: 48px;
+            spacing: 8px;
+            Rectangle {
+                width: 84px;
+                border-radius: 12px;
+                background: back-touch.pressed ? Palette.faint : transparent;
+                Text {
+                    text: "‹ Back";
+                    color: Palette.accent;
+                    font-size: 17px;
+                }
+                back-touch := TouchArea {
+                    clicked => { root.back(); }
+                }
+            }
+            Text {
+                text: root.title;
+                color: Palette.text;
+                font-size: 22px;
+                vertical-alignment: center;
+            }
+        }
+        @children
+    }
+}
+
+component SignalBars inherits HorizontalLayout {
+    in property <int> bars;
+    spacing: 2px;
+    alignment: end;
+    for i in 4: Rectangle {
+        width: 4px;
+        height: 6px + i * 4px;
+        y: parent.height - self.height;
+        border-radius: 1px;
+        background: i < root.bars + 1 ? Palette.text : Palette.faint;
+    }
+}
+
+// On-screen keyboard; edits `value` directly.
+component Keyboard inherits VerticalLayout {
+    in-out property <string> value;
+    in property <int> max-length: 63;
+    callback submit();
+    property <bool> shift;
+    property <bool> symbols;
+    property <[[string]]> letters: [
+        ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
+        ["a", "s", "d", "f", "g", "h", "j", "k", "l"],
+        ["z", "x", "c", "v", "b", "n", "m"],
+    ];
+    property <[[string]]> letters-upper: [
+        ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
+        ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
+        ["Z", "X", "C", "V", "B", "N", "M"],
+    ];
+    property <[[string]]> symbol-rows: [
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+        ["-", "_", "@", "#", "$", "%", "&", "*", "!"],
+        [".", ",", "?", "'", "+", "=", "/"],
+    ];
+    property <[[string]]> rows: root.symbols ? root.symbol-rows : root.shift ? root.letters-upper : root.letters;
+
+    pure function append(key: string) -> string {
+        root.value + key
+    }
+
+    spacing: 5px;
+    for row[r] in root.rows: HorizontalLayout {
+        spacing: 4px;
+        alignment: center;
+        height: 40px;
+        if r == 2: Button {
+            width: 62px;
+            height: 40px;
+            text: root.symbols ? "" : "⇧";
+            primary: root.shift && !root.symbols;
+            enabled: !root.symbols;
+            clicked => { root.shift = !root.shift; }
+        }
+        for key in row: Button {
+            width: 41px;
+            height: 40px;
+            text: key;
+            font-size: 18px;
+            clicked => {
+                if (root.value.character-count < root.max-length) {
+                    root.value = root.append(key);
+                }
+                root.shift = false;
+            }
+        }
+        if r == 2: Button {
+            width: 62px;
+            height: 40px;
+            text: "⌫";
+            clicked => {
+                root.value = TextOps.drop-last(root.value);
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 4px;
+        height: 40px;
+        Button {
+            width: 72px;
+            height: 40px;
+            text: root.symbols ? "abc" : "123";
+            clicked => { root.symbols = !root.symbols; }
+        }
+        Button {
+            height: 40px;
+            text: "space";
+            clicked => {
+                if (root.value.character-count < root.max-length) {
+                    root.value = root.append(" ");
+                }
+            }
+        }
+        Button {
+            width: 96px;
+            height: 40px;
+            text: "Join";
+            primary: true;
+            clicked => { root.submit(); }
+        }
+    }
+}
+
+component WifiPanel inherits Panel {
+    in property <SettingsState> state;
+    callback set-enabled(bool);
+    callback scan();
+    callback join(string /* ssid */, string /* password */);
+    // Leave the panel (Back while not typing a password).
+    callback close();
+    property <string> selected;
+    property <string> password;
+    property <bool> show-password;
+    property <bool> typing;
+    title: root.typing ? "Password" : "Wi-Fi";
+
+    if !root.typing: VerticalLayout {
+        spacing: 10px;
+        Card {
+            height: 64px;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 14px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.state.wifi-enabled ? "Wi-Fi on" : "Wi-Fi off";
+                        color: Palette.text;
+                        font-size: 18px;
+                    }
+                    Caption {
+                        text: root.state.wifi-status;
+                        overflow: elide;
+                    }
+                }
+                Toggle {
+                    y: (parent.height - self.height) / 2;
+                    on: root.state.wifi-enabled;
+                    toggled(on) => { root.set-enabled(on); }
+                }
+            }
+        }
+        if root.state.wifi-enabled: Card {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 2px;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    height: 30px;
+                    Caption {
+                        text: root.state.wifi-busy ? "Searching…" : "Networks";
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        width: 110px;
+                        height: 30px;
+                        font-size: 14px;
+                        text: "Scan again";
+                        enabled: !root.state.wifi-busy;
+                        clicked => { root.scan(); }
+                    }
+                }
+                Flickable {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: start;
+                        for net in root.state.networks: Rectangle {
+                            height: 48px;
+                            border-radius: 10px;
+                            background: net-touch.pressed ? Palette.faint : net.connected ? Palette.accent.with-alpha(0.12) : transparent;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 10px;
+                                Text {
+                                    text: net.ssid;
+                                    color: net.connected ? Palette.accent : Palette.text;
+                                    font-size: 17px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                if net.connected: Text {
+                                    text: "connected";
+                                    color: Palette.accent;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                if net.secure: Image {
+                                    width: 16px;
+                                    y: (parent.height - 16px) / 2;
+                                    height: 16px;
+                                    source: @image-url("img/lock.svg");
+                                    colorize: Palette.muted;
+                                }
+                                SignalBars {
+                                    width: 22px;
+                                    height: 20px;
+                                    y: (parent.height - 20px) / 2;
+                                    bars: net.bars;
+                                }
+                            }
+                            net-touch := TouchArea {
+                                clicked => {
+                                    root.selected = net.ssid;
+                                    if (net.secure) {
+                                        root.password = "";
+                                        root.typing = true;
+                                    } else {
+                                        root.join(net.ssid, "");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !root.state.wifi-enabled: Card {
+            vertical-stretch: 1;
+            Text {
+                width: parent.width - 48px;
+                text: "The radio is switched off completely: nothing is transmitted.\n\nWithout Wi-Fi there is no forecast and no automatic clock; tonight's plan is based on last night's temperatures.";
+                color: Palette.muted;
+                font-size: 15px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    if root.typing: VerticalLayout {
+        spacing: 8px;
+        alignment: start;
+        Caption { text: "Network: " + root.selected; }
+        Card {
+            height: 52px;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 6px;
+                Text {
+                    text: root.show-password ? root.password + "▏" : root.password-mask + "▏";
+                    color: Palette.text;
+                    font-size: 20px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Rectangle {
+                    width: 44px;
+                    Image {
+                        width: 26px;
+                        height: 26px;
+                        source: @image-url("img/eye.svg");
+                        colorize: root.show-password ? Palette.accent : Palette.muted;
+                    }
+                    TouchArea {
+                        clicked => { root.show-password = !root.show-password; }
+                    }
+                }
+            }
+        }
+        Rectangle { height: 6px; }
+        Keyboard {
+            value <=> root.password;
+            submit => {
+                root.join(root.selected, root.password);
+                root.typing = false;
+                root.show-password = false;
+            }
+        }
+    }
+
+    property <string> password-mask: TextOps.mask(root.password);
+
+    back => {
+        if (root.typing) {
+            root.typing = false;
+        } else {
+            root.close();
+        }
+    }
+}
+
+component SensitivityPanel inherits Panel {
+    in property <SettingsState> state;
+    callback set-sensitivity(int);
+    title: "Thermal sensitivity";
+
+    Caption {
+        text: "How warm does your baby sleep compared to most babies?";
+        wrap: word-wrap;
+        font-size: 15px;
+    }
+    // Five steps from cool (blue) to warm (red).
+    HorizontalLayout {
+        spacing: 6px;
+        height: 96px;
+        for step[i] in [-2, -1, 0, 1, 2]: Rectangle {
+            border-radius: 14px;
+            background: root.state.sensitivity == step ? Palette.step(i) : Palette.card;
+            border-width: root.state.sensitivity == step ? 0px : 2px;
+            border-color: Palette.step(i).with-alpha(0.6);
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                Text {
+                    text: step < 0 ? "−" + abs(step) : step > 0 ? "+" + step : "0";
+                    color: root.state.sensitivity == step ? #2a2433 : Palette.text;
+                    font-size: 26px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: i == 0 ? "cool" : i == 2 ? "typical" : i == 4 ? "warm" : "";
+                    color: root.state.sensitivity == step ? #2a2433 : Palette.muted;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+            TouchArea {
+                clicked => { root.set-sensitivity(step); }
+            }
+        }
+    }
+    Card {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 8px;
+            Text {
+                text: root.state.sensitivity-label;
+                color: Palette.text;
+                font-size: 22px;
+            }
+            Text {
+                text: root.state.sensitivity-explanation;
+                color: Palette.muted;
+                font-size: 15px;
+                wrap: word-wrap;
+            }
+            Rectangle { height: 6px; }
+            Caption { text: "Tonight this means"; }
+            Text {
+                text: root.state.sensitivity-preview;
+                color: Palette.accent;
+                font-size: 17px;
+                wrap: word-wrap;
+            }
+            Rectangle { vertical-stretch: 1; }
+            Caption {
+                text: "Babies differ: if yours is often sweaty, choose warm; if hands and chest feel cool, choose cool.";
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+component BrightnessPanel inherits Panel {
+    in property <SettingsState> state;
+    callback set-brightness(int);
+    title: "Brightness";
+
+    Card {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding: 20px;
+            spacing: 18px;
+            alignment: center;
+            Text {
+                text: root.state.brightness + " %";
+                color: Palette.text;
+                font-size: 44px;
+                horizontal-alignment: center;
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                height: 40px;
+                for level in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]: Rectangle {
+                    border-radius: 4px;
+                    background: level <= root.state.brightness ? Palette.accent.mix(#ffffff, 0.3 + level / 150) : Palette.faint;
+                    TouchArea {
+                        clicked => { root.set-brightness(level); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 14px;
+                Button {
+                    height: 64px;
+                    text: "−  Dimmer";
+                    font-size: 20px;
+                    enabled: root.state.brightness > 10;
+                    clicked => { root.set-brightness(max(10, root.state.brightness - 10)); }
+                }
+                Button {
+                    height: 64px;
+                    text: "+  Brighter";
+                    font-size: 20px;
+                    enabled: root.state.brightness < 100;
+                    clicked => { root.set-brightness(min(100, root.state.brightness + 10)); }
+                }
+            }
+            Caption {
+                text: "The screen also turns off after 3 minutes without a touch.";
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+component AboutPanel inherits Panel {
+    in property <SettingsState> state;
+    title: "About";
+    Card {
+        vertical-stretch: 1;
+        Flickable {
+            VerticalLayout {
+                padding: 14px;
+                spacing: 2px;
+                alignment: start;
+                for row in root.state.about: HorizontalLayout {
+                    height: 34px;
+                    spacing: 10px;
+                    Text {
+                        width: 130px;
+                        text: row.label;
+                        color: Palette.muted;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: row.value;
+                        color: Palette.text;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SettingsView inherits Rectangle {
+    in property <SettingsState> state;
+    in property <string> clock;
+    // 0 none, 1 Wi-Fi, 2 sensitivity, 3 brightness, 4 about.
+    in-out property <int> open-panel;
+    callback clock-clicked();
+    callback set-wifi-enabled(bool);
+    callback wifi-scan();
+    callback wifi-join(string, string);
+    callback set-sensitivity(int);
+    callback set-brightness(int);
+
+    VerticalLayout {
+        spacing: 10px;
+        Header {
+            title: "Settings";
+            subtitle: root.state.version;
+            clock: root.clock;
+            icon: 2;
+            clock-clicked => { root.clock-clicked(); }
+        }
+        GridLayout {
+            spacing: 10px;
+            Row {
+                Tile {
+                    icon: root.state.wifi-enabled ? @image-url("img/wifi.svg") : @image-url("img/wifi-off.svg");
+                    tone: root.state.wifi-enabled ? #7fb2ff : Palette.muted;
+                    title: "Wi-Fi";
+                    status: root.state.wifi-summary;
+                    clicked => {
+                        root.open-panel = 1;
+                        if (root.state.wifi-enabled) {
+                            root.wifi-scan();
+                        }
+                    }
+                }
+                Tile {
+                    icon: @image-url("img/thermometer.svg");
+                    tone: Palette.step(root.state.sensitivity + 2);
+                    title: "Sensitivity";
+                    status: root.state.sensitivity-label;
+                    clicked => { root.open-panel = 2; }
+                }
+            }
+            Row {
+                Tile {
+                    icon: @image-url("img/brightness.svg");
+                    tone: Palette.accent;
+                    title: "Brightness";
+                    status: root.state.brightness + " %";
+                    clicked => { root.open-panel = 3; }
+                }
+                Tile {
+                    icon: @image-url("img/info.svg");
+                    tone: Palette.muted;
+                    title: "About";
+                    status: root.state.version;
+                    clicked => { root.open-panel = 4; }
+                }
+            }
+        }
+    }
+
+    if root.open-panel == 1: WifiPanel {
+        state: root.state;
+        close => { root.open-panel = 0; }
+        set-enabled(on) => { root.set-wifi-enabled(on); }
+        scan => { root.wifi-scan(); }
+        join(ssid, password) => { root.wifi-join(ssid, password); }
+    }
+    if root.open-panel == 2: SensitivityPanel {
+        state: root.state;
+        back => { root.open-panel = 0; }
+        set-sensitivity(step) => { root.set-sensitivity(step); }
+    }
+    if root.open-panel == 3: BrightnessPanel {
+        state: root.state;
+        back => { root.open-panel = 0; }
+        set-brightness(level) => { root.set-brightness(level); }
+    }
+    if root.open-panel == 4: AboutPanel {
+        state: root.state;
+        back => { root.open-panel = 0; }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Main window: three pages (morning, tonight, settings) side by side; swipe or tap the dots.
+// ---------------------------------------------------------------------------------------------
+
+export component NurseryScreen inherits Window {
+    width: 480px;
+    height: 480px;
+    background: Palette.background;
+    default-font-family: "DejaVu Sans";
+    title: "Nursery";
+
+    // 0 = morning, 1 = tonight, 2 = settings.
+    in-out property <int> page: 1;
+    in property <string> clock: "--:--";
+    in property <Morning> morning;
+    in property <Evening> evening;
+    in property <SettingsState> settings;
+    // Screen off: everything black until touched.
+    in property <bool> asleep;
+    in-out property <bool> clock-editor-open;
+    in-out property <int> settings-panel;
+    // Desktop simulator only: darken the window to preview the brightness setting.
+    in property <bool> simulate-brightness;
+
+    // Any touch (the device turns the backlight off after a few idle minutes).
+    callback activity();
+    // A touch while asleep.
+    callback wake();
+    // The user moved to another page.
+    callback page-changed(int);
+    callback adjust-clock(int /* minutes */);
+    callback set-wifi-enabled(bool);
+    callback wifi-scan();
+    callback wifi-join(string /* ssid */, string /* password */);
+    callback set-sensitivity(int);
+    callback set-brightness(int);
+    // Tap on the baby: dress without a bodysuit (or with one again).
+    callback toggle-bodysuit();
+
+    function go(target: int) {
+        root.activity();
+        if (target >= 0 && target <= 2 && target != root.page) {
+            root.page = target;
+            root.settings-panel = 0;
+            root.page-changed(target);
+        }
+    }
+
+    // Catches touches on empty areas so they still count as activity.
+    TouchArea {
+        clicked => { root.activity(); }
+    }
+
+    swipe := SwipeGestureHandler {
+        // No paging while a settings panel (e.g. the keyboard) is open.
+        handle-swipe-left: root.page < 2 && root.settings-panel == 0;
+        handle-swipe-right: root.page > 0 && root.settings-panel == 0;
+        swiped => {
+            if (self.current-position.x < self.pressed-position.x) {
+                root.go(root.page + 1);
+            } else {
+                root.go(root.page - 1);
+            }
+        }
+
+        // The strip of pages; it follows the finger while swiping.
+        strip := Rectangle {
+            x: -root.page * root.width + (swipe.swiping ? swipe.current-position.x - swipe.pressed-position.x : 0px);
+            width: 3 * root.width;
+            animate x { duration: 220ms; easing: ease-out; }
+
+            Rectangle {
+                x: 16px;
+                y: 8px;
+                width: root.width - 32px;
+                height: root.height - 32px;
+                clip: true;
+                MorningView {
+                    data: root.morning;
+                    clock: root.clock;
+                    toggle-bodysuit => { root.activity(); root.toggle-bodysuit(); }
+                    clock-clicked => { root.activity(); root.clock-editor-open = true; }
+                }
+            }
+            Rectangle {
+                x: root.width + 16px;
+                y: 8px;
+                width: root.width - 32px;
+                height: root.height - 32px;
+                clip: true;
+                EveningView {
+                    data: root.evening;
+                    clock: root.clock;
+                    toggle-bodysuit => { root.activity(); root.toggle-bodysuit(); }
+                    clock-clicked => { root.activity(); root.clock-editor-open = true; }
+                }
+            }
+            Rectangle {
+                x: 2 * root.width + 16px;
+                y: 8px;
+                width: root.width - 32px;
+                height: root.height - 32px;
+                clip: true;
+                SettingsView {
+                    state: root.settings;
+                    clock: root.clock;
+                    open-panel <=> root.settings-panel;
+                    clock-clicked => { root.activity(); root.clock-editor-open = true; }
+                    set-wifi-enabled(on) => { root.activity(); root.set-wifi-enabled(on); }
+                    wifi-scan => { root.activity(); root.wifi-scan(); }
+                    wifi-join(ssid, password) => { root.activity(); root.wifi-join(ssid, password); }
+                    set-sensitivity(step) => { root.activity(); root.set-sensitivity(step); }
+                    set-brightness(level) => { root.activity(); root.set-brightness(level); }
+                }
+            }
+        }
+    }
+
+    // Page dots.
+    HorizontalLayout {
+        y: root.height - 22px;
+        height: 18px;
+        alignment: center;
+        spacing: 4px;
+        for i in 3: Rectangle {
+            width: 28px;
+            Rectangle {
+                width: root.page == i ? 18px : 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.page == i ? Palette.accent : Palette.faint;
+                animate width { duration: 150ms; }
+            }
+            TouchArea {
+                clicked => { root.go(i); }
+            }
+        }
+    }
+
+    if root.clock-editor-open: ClockEditor {
+        clock: root.clock;
+        adjust(minutes) => { root.activity(); root.adjust-clock(minutes); }
+        done => { root.activity(); root.clock-editor-open = false; }
+    }
+
+    if root.simulate-brightness: Rectangle {
+        background: #000000;
+        opacity: 0.8 * (1 - root.settings.brightness / 100);
+    }
+
+    if root.asleep: Rectangle {
+        background: #000000;
+        TouchArea {
+            clicked => { root.wake(); }
+        }
+    }
+}

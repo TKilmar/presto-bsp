@@ -1,0 +1,3 @@
+[build]
+# The repository root targets the RP2350; this crate runs on the host.
+target = "host-tuple"

@@ -1,0 +1,22 @@
+[package]
+name = "presto-emu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runs Presto firmware in the rp2350-emu RP2350 emulator and checks the LCD waveforms."
+
+[dependencies]
+rp2350-emu = "0.2.6"
+object = { version = "0.40", default-features = false, features = ["read", "elf"] }
+
+[profile.release]
+debug = 1
+
+[profile.dev]
+opt-level = 3
+
+# Emulator fixes (see README.md): `./setup.sh` copies these crates from the cargo registry into
+# vendor/ and applies patches/*.patch.
+[patch.crates-io]
+rp2350-emu = { path = "vendor/rp2350-emu" }
+picoem-common = { path = "vendor/picoem-common" }
