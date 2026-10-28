@@ -40,15 +40,16 @@ move between three pages:
    - **Brightness:** 10–100 %.
    - **About:** firmware version, sensors found, Wi-Fi MAC and IP address, uptime, memory.
 
-**Tap the baby** to dress without a bodysuit. The bodysuit is then drawn as a faded, dotted
-outline, and the recommendation makes up the missing insulation with a warmer bag (or warns if
-even the warmest bag is not enough). Tap again to bring the bodysuit back.
+**Tap the sleeping bag** for a night without it. The bag is then drawn faded, and the
+recommendation makes up the missing insulation with warmer clothes over the bodysuit (or says to
+use the bag if even a sleepsuit is not enough; it never suggests loose blankets). Tap the faded
+bag to bring it back.
 
 The screen picks Morning (05:00–11:00) or Tonight by time of day, and turns off after
 3 minutes without a touch. Touch the screen or press the button to wake it. **Tap the time** to
-set the clock by hand. Settings, the bodysuit choice and the Wi-Fi network are saved in flash.
+set the clock by hand. Settings, the sleeping-bag choice and the Wi-Fi network are saved in flash.
 
-![Simulator: morning, tonight, settings, Wi-Fi, sensitivity, no bodysuit](nursery/preview.png)
+![Simulator: morning, tonight, settings, Wi-Fi, sensitivity, no sleeping bag](nursery/preview.png)
 
 ### How tonight is predicted
 
@@ -71,7 +72,7 @@ cargo run -- cold              # start from a preset
 cargo run -- --screenshot out.png wifi      # render headlessly, exactly as the panel will
 ```
 
-- **Presets:** evening, morning, cold, hot, smoky, no-sensors, no-wifi, no-bodysuit, settings,
+- **Presets:** evening, morning, cold, hot, smoky, stuffy, no-sensors, no-wifi, no-bag, settings,
   wifi, sensitivity, brightness, about.
 - **Simulated Wi-Fi:** the radio switch works, scans find four networks, and passwords shorter
   than 8 characters are rejected. The forecast only arrives while "connected", as on the device.
@@ -89,9 +90,10 @@ Where things live:
 - `src/bin/nursery/` is the firmware: `main.rs` (UI loop), `wifi.rs` (radio, DHCP, HTTP) and
   `storage.rs` (settings in flash).
 - `nursery-core/` is the logic, unit tested on the host (`cd nursery-core && cargo test`):
-  - `sleepwear.rs`: the TOG ladder, sensitivity and bodysuit adaptation.
+  - `sleepwear.rs`: the TOG ladder, sensitivity and the no-sleeping-bag adaptation.
   - `planner.rs`: the overnight estimate.
   - `history.rs`: the night summary.
+  - `air.rs`: PM2.5 and CO₂ categories.
   - `net.rs`: HTTP, forecast and location parsing.
   - `settings.rs`: the flash format.
 
@@ -100,7 +102,7 @@ Where things live:
 | Part | Connection | Notes |
 | --- | --- | --- |
 | PMSA003I PM2.5 sensor | Qwiic / STEMMA QT (I2C 0x12) | Readings are ignored for 30 s after power-up while the fan settles. I2C runs at 100 kHz. |
-| SHT40/41/45 temperature + humidity | Qwiic, daisy-chained (I2C 0x44) | **Needed for temperature.** The PMSA003I measures particles only. |
+| SCD40 CO₂ + temperature + humidity | Qwiic, daisy-chained (I2C 0x62) | **Needed for temperature.** The PMSA003I measures particles only. Keep it away from the Presto and other warm parts (it already subtracts 4 °C of self-heating), and air the room now and then: it recalibrates assuming it sees outdoor air (≈420 ppm) about once a week. |
 | RM2 Wi-Fi (on the Presto) | PIO2, GPIO23/24/25/29 | Firmware blobs in `nursery/cyw43-firmware/`. |
 
 Either sensor can be missing; the screen says what it cannot show.

@@ -8,14 +8,14 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use nursery_core::air::AirQuality;
+use nursery_core::air::{self, AirQuality, Co2Level};
 use nursery_core::clock::{self, Minutes, View};
 use nursery_core::forecast::Forecast;
 use nursery_core::history::{History, NightSummary, Reading};
 use nursery_core::planner::{self, Basis, Plan};
 use nursery_core::settings::Settings;
 use nursery_core::sleepwear::{self, Comfort, Recommendation};
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::{AboutRow, Bar, Evening, Morning, NurseryScreen, SettingsState, TextOps, WifiNetwork};
 
@@ -186,9 +186,9 @@ impl App {
         self.settings
     }
 
-    /// Toggle sleeping without a bodysuit. Returns the new settings to store.
-    pub fn toggle_bodysuit(&mut self) -> Settings {
-        self.settings.no_bodysuit = !self.settings.no_bodysuit;
+    /// Toggle sleeping without the sleeping bag. Returns the new settings to store.
+    pub fn toggle_bag(&mut self) -> Settings {
+        self.settings.no_bag = !self.settings.no_bag;
         self.settings
     }
 
@@ -223,10 +223,26 @@ impl App {
         }
         // When the clock is unset, assume a typical evening for the plan.
         let now = self.now.unwrap_or(Minutes(clock::DAY + Minutes::hm(19, 0).0));
-        ui.set_morning(self.morning(now));
-        let evening = self.evening(now);
-        ui.set_settings(self.settings_state(&evening.recommendation, &evening.dress_for));
-        ui.set_evening(evening);
+        // Only hand Slint what changed: a new model, even with the same rows, redraws its whole
+        // chart, and on the Presto every redraw competes with scan-out for the QSPI bus.
+        let (old_morning, old_evening, old_settings) = (ui.get_morning(), ui.get_evening(), ui.get_settings());
+        let mut morning = self.morning(now);
+        keep_model(&mut morning.temp_bars, &old_morning.temp_bars);
+        keep_model(&mut morning.air_bars, &old_morning.air_bars);
+        if morning != old_morning {
+            ui.set_morning(morning);
+        }
+        let mut evening = self.evening(now);
+        keep_model(&mut evening.plan_bars, &old_evening.plan_bars);
+        let mut settings = self.settings_state(&evening.recommendation, &evening.dress_for);
+        keep_model(&mut settings.networks, &old_settings.networks);
+        keep_model(&mut settings.about, &old_settings.about);
+        if settings != old_settings {
+            ui.set_settings(settings);
+        }
+        if evening != old_evening {
+            ui.set_evening(evening);
+        }
     }
 
     fn settings_state(&self, tonight: &crate::Recommendation, dress_for: &str) -> SettingsState {
@@ -270,8 +286,8 @@ impl App {
             sensitivity_label: sleepwear::sensitivity_label(s.sensitivity).into(),
             sensitivity_explanation: sleepwear::sensitivity_explanation(s.sensitivity).into(),
             sensitivity_preview: if tonight.valid {
-                format!("{} TOG sleeping bag + {} ({})", tonight.bag_tog, tonight.outfit_label.to_lowercase(), dress_for.to_lowercase())
-                    .into()
+                let bag = if tonight.bag_used { format!("{} TOG sleeping bag", tonight.bag_tog) } else { "No sleeping bag".into() };
+                format!("{bag} + {} ({})", tonight.outfit_label.to_lowercase(), dress_for.to_lowercase()).into()
             } else {
                 "A room temperature is needed for a recommendation.".into()
             },
@@ -306,7 +322,7 @@ impl App {
         };
         let coolest = night.celsius.min;
         let recommendation = coolest
-            .map(|(t, _)| adapt(sleepwear::recommend_for(t, self.settings.sensitivity), self.settings.no_bodysuit));
+            .map(|(t, _)| adapt(sleepwear::recommend_for(t, self.settings.sensitivity), self.settings.no_bag));
         Morning {
             has_data: true,
             note: SharedString::new(),
@@ -321,10 +337,17 @@ impl App {
                 _ => SharedString::new(),
             },
             temp_bars: temperature_bars(night.hourly.iter().map(|slot| slot.celsius)),
-            air_label: night.air_quality().map_or("No PM sensor", AirQuality::label).into(),
-            air_level: night.air_quality().map_or(0, AirQuality::level),
+            air_label: air::overall(night.air_quality(), night.co2_level()).map_or("No air sensor", |(l, _)| l).into(),
+            air_level: air::overall(night.air_quality(), night.co2_level()).map_or(0, |(_, level)| level),
             air_detail: air_detail(&night),
-            air_bars: air_bars(night.hourly.iter().map(|slot| slot.pm25)),
+            co2_detail: co2_detail(&night),
+            // CO₂ shows how the night went (it climbs while the room is shut); PM2.5 is usually
+            // flat, so it is charted only without a CO₂ sensor.
+            air_bars: if night.co2.mean().is_some() {
+                co2_bars(night.hourly.iter().map(|slot| slot.co2))
+            } else {
+                air_bars(night.hourly.iter().map(|slot| slot.pm25))
+            },
             called_for: match coolest {
                 Some((t, _)) => format!("The coolest part ({t:.1}°) called for").into(),
                 None => SharedString::new(),
@@ -343,11 +366,18 @@ impl App {
             let (_, end) = clock::tonight(now);
             self.rain(end, Minutes(end.0 + 5 * 60), "tomorrow morning", "07:00 – 12:00")
         };
-        let air = self.latest.pm25.map(AirQuality::from_pm25);
-        let (air_label, air_level, air_detail) = match (air, self.latest.pm25) {
-            (Some(q), Some(pm)) => (q.label().into(), q.level(), format!("{pm:.0} µg/m³ now").into()),
-            _ => ("No PM sensor".into(), 0, SharedString::new()),
-        };
+        let (air_label, air_level) = air::overall(
+            self.latest.pm25.map(AirQuality::from_pm25),
+            self.latest.co2.map(Co2Level::from_ppm),
+        )
+        .map_or(("No air sensor".into(), 0), |(label, level)| (label.into(), level));
+        let air_detail = match (self.latest.pm25, self.latest.co2) {
+            (Some(pm), Some(co2)) => format!("PM {pm:.0} · CO₂ {co2:.0} ppm"),
+            (Some(pm), None) => format!("PM2.5 {pm:.0} µg/m³"),
+            (None, Some(co2)) => format!("CO₂ {co2:.0} ppm"),
+            (None, None) => String::new(),
+        }
+        .into();
         let Some(room) = self.latest.celsius else {
             return Evening {
                 room_now: "--°".into(),
@@ -359,7 +389,7 @@ impl App {
                 expected_low: "--".into(),
                 expected_detail: "Needs a room temperature".into(),
                 recommendation: missing_recommendation(
-                    "Connect a temperature sensor (SHT4x on the Qwiic port) to get a clothing recommendation.",
+                    "Connect the SCD40 sensor to the Qwiic port to get a clothing recommendation.",
                 ),
                 rain_level,
                 rain_title,
@@ -383,7 +413,7 @@ impl App {
             outdoor_note: outdoor_note(&plan),
             plan_bars: temperature_bars(plan.hourly.iter().map(|&t| Some(t))),
             dress_for: format!("Dress for {:.1}°", plan.expected_low).into(),
-            recommendation: ui_recommendation(adapt(plan.recommendation, self.settings.no_bodysuit)),
+            recommendation: ui_recommendation(adapt(plan.recommendation, self.settings.no_bag)),
             rain_level,
             rain_title,
             rain_detail,
@@ -414,12 +444,20 @@ impl App {
 fn air_detail(night: &NightSummary) -> SharedString {
     match (night.pm25.mean(), night.pm25.max) {
         (Some(mean), Some((max, at))) => {
-            let mut s = format!("avg {mean:.0} · max {max:.0}");
+            let mut s = format!("PM2.5 avg {mean:.0} · max {max:.0}");
             if night.worst_air_quality() > night.air_quality() {
                 s += &format!(" at {:02}:{:02}", at.hour(), at.minute());
             }
             s.into()
         }
+        _ => SharedString::new(),
+    }
+}
+
+fn co2_detail(night: &NightSummary) -> SharedString {
+    match (night.co2.mean(), night.co2.max) {
+        // No peak time: it is nearly always just before the room is aired in the morning.
+        (Some(mean), Some((max, _))) => format!("CO₂ avg {mean:.0} · max {max:.0} ppm").into(),
         _ => SharedString::new(),
     }
 }
@@ -445,9 +483,9 @@ fn outdoor_note(plan: &Plan) -> SharedString {
     }
 }
 
-/// Apply the user's no-bodysuit preference.
-fn adapt(r: Recommendation, no_bodysuit: bool) -> Recommendation {
-    if no_bodysuit { r.without_bodysuit() } else { r }
+/// Apply the user's no-sleeping-bag choice.
+fn adapt(r: Recommendation, no_bag: bool) -> Recommendation {
+    if no_bag { r.without_bag() } else { r }
 }
 
 fn missing_recommendation(why: &str) -> crate::Recommendation {
@@ -459,19 +497,21 @@ fn ui_recommendation(r: Recommendation) -> crate::Recommendation {
         valid: true,
         missing: SharedString::new(),
         outfit: r.outfit.index(),
-        ghost: match r.skipped_from {
-            Some(sleepwear::Outfit::ShortSleeve) => 1,
-            Some(sleepwear::Outfit::LongSleeve) => 2,
-            Some(_) => 3,
-            None => 0,
-        },
-        can_toggle_bodysuit: r.skipped_from.is_some() || r.outfit.has_bodysuit(),
+        bag_used: r.bag_used,
         outfit_label: r.outfit.label().into(),
         bag_tog: tog(r.bag_tog).into(),
         bag_index: r.bag_index(),
         total: format!("≈ {} TOG in total", tog(r.total_tog())).into(),
         advice: r.advice().into(),
-        comfort: r.comfort.index(),
+        // The advice is coloured by comfort; "too cool without a bag" is a cold warning.
+        comfort: if r.short_by > 0.25 { Comfort::Cold.index() } else { r.comfort.index() },
+    }
+}
+
+/// Replace `new` with `old` when they hold the same rows, so the struct compares equal.
+fn keep_model<T: Clone + PartialEq + 'static>(new: &mut ModelRc<T>, old: &ModelRc<T>) {
+    if new.row_count() == old.row_count() && new.iter().zip(old.iter()).all(|(a, b)| a == b) {
+        *new = old.clone();
     }
 }
 
@@ -502,6 +542,21 @@ fn air_bars(values: impl Iterator<Item = Option<f32>>) -> ModelRc<Bar> {
             Some(pm) => Bar {
                 level: libm::sqrtf(pm.max(0.0) / 75.0).clamp(0.05, 1.0),
                 tone: AirQuality::from_pm25(pm).level(),
+                empty: false,
+            },
+            None => Bar { level: 0.0, tone: 0, empty: true },
+        })
+        .collect();
+    ModelRc::new(VecModel::from(bars))
+}
+
+/// Bars from outdoor air (400 ppm) to 2000 ppm, coloured by ventilation category.
+fn co2_bars(values: impl Iterator<Item = Option<f32>>) -> ModelRc<Bar> {
+    let bars: Vec<Bar> = values
+        .map(|v| match v {
+            Some(ppm) => Bar {
+                level: ((ppm - 400.0) / 1600.0).clamp(0.05, 1.0),
+                tone: Co2Level::from_ppm(ppm).level(),
                 empty: false,
             },
             None => Bar { level: 0.0, tone: 0, empty: true },

@@ -64,7 +64,7 @@ const TODAY: u32 = 10;
 struct View {
     page: Option<i32>,
     panel: i32,
-    no_bodysuit: bool,
+    no_bag: bool,
     wifi_off: bool,
 }
 
@@ -74,10 +74,12 @@ fn base_scenario() -> Scenario {
         room: 21.5,
         humidity: 48.0,
         pm25: 4.0,
+        co2: 650.0,
         night_start: 21.0,
         night_drop: 2.5,
         night_pm: 5.0,
         night_spike: false,
+        night_co2: 1150.0,
         has_forecast: true,
         outdoor_low: 6.0,
         rain_chance: 70.0,
@@ -89,7 +91,7 @@ fn base_scenario() -> Scenario {
 }
 
 const PRESETS: &[&str] = &[
-    "evening", "morning", "cold", "hot", "smoky", "no-sensors", "no-wifi", "no-bodysuit", "settings", "wifi",
+    "evening", "morning", "cold", "hot", "smoky", "stuffy", "no-sensors", "no-wifi", "no-bag", "settings", "wifi",
     "sensitivity", "brightness", "about",
 ];
 
@@ -108,9 +110,10 @@ fn preset(name: &str) -> Option<(Scenario, View)> {
             View::default(),
         ),
         "smoky" => (Scenario { time: 7.0 * 60.0, pm25: 38.0, night_pm: 22.0, night_spike: true, ..base }, View::default()),
+        "stuffy" => (Scenario { time: 6.0 * 60.0 + 50.0, co2: 1750.0, night_co2: 2300.0, ..base }, View::default()),
         "no-sensors" => (Scenario { has_temp: false, has_pm: false, has_forecast: false, ..base }, View::default()),
         "no-wifi" => (base, View { wifi_off: true, ..Default::default() }),
-        "no-bodysuit" => (base, View { no_bodysuit: true, ..Default::default() }),
+        "no-bag" => (base, View { no_bag: true, ..Default::default() }),
         "settings" => (base, settings(0)),
         "wifi" => (base, settings(1)),
         "sensitivity" => (base, settings(2)),
@@ -164,12 +167,20 @@ fn apply(app: &mut App, s: &Scenario) {
         } + 0.1 * rand();
         let spike = s.night_spike && (23 * 60..23 * 60 + 40).contains(&t.of_day());
         let pm = (s.night_pm * (1.0 + 0.4 * rand()) + if spike { 60.0 } else { 0.0 }).max(0.0);
+        // CO₂ climbs from 600 ppm at 19:00 to `night_co2` at 07:00 while the room is shut, and
+        // airs out during the day.
+        let co2 = if since_19 < 12 * 60 {
+            600.0 + (s.night_co2 - 600.0) * (since_19 as f32 / (12.0 * 60.0)).powf(0.7)
+        } else {
+            600.0
+        } + 20.0 * rand();
         history.record(
             t,
             Reading {
                 celsius: s.has_temp.then_some(celsius),
                 humidity: s.has_temp.then_some(s.humidity + 3.0 * rand()),
                 pm25: s.has_pm.then_some(pm),
+                co2: s.has_temp.then_some(co2),
                 outdoor: (s.has_forecast && online).then_some(outdoor_at(s.outdoor_low + 2.0, t)),
             },
         );
@@ -179,6 +190,7 @@ fn apply(app: &mut App, s: &Scenario) {
         celsius: s.has_temp.then_some(s.room),
         humidity: s.has_temp.then_some(s.humidity),
         pm25: s.has_pm.then_some(s.pm25),
+        co2: s.has_temp.then_some(s.co2),
         outdoor: None,
     };
 
@@ -219,7 +231,7 @@ fn about_rows() -> Vec<(String, String)> {
         ("Running on".into(), "Desktop simulator".into()),
         ("Device".into(), "Pimoroni Presto · RP2350B".into()),
         ("Display".into(), "480×480 ST7701 · 63 Hz".into()),
-        ("Sensors".into(), "PMSA003I · SHT4x (simulated)".into()),
+        ("Sensors".into(), "PMSA003I · SCD40 (simulated)".into()),
         ("Wi-Fi MAC".into(), "28:cd:c1:00:00:00 (simulated)".into()),
         ("UI".into(), "Slint 1.18".into()),
     ]
@@ -249,7 +261,7 @@ fn screenshot(scenario: &Scenario, view: View, path: &Path) -> Result<(), Box<dy
     let mut app = App::new(0);
     app.version = version();
     app.about = about_rows();
-    app.settings.no_bodysuit = view.no_bodysuit;
+    app.settings.no_bag = view.no_bag;
     if view.wifi_off {
         app.wifi.link = WifiLink::Off;
     } else {
@@ -309,7 +321,7 @@ fn interactive(initial: Scenario, view: View) -> Result<(), Box<dyn std::error::
         app.version = version();
         app.about = about_rows();
         app.page_override = view.page;
-        app.settings.no_bodysuit = view.no_bodysuit;
+        app.settings.no_bag = view.no_bag;
         if !view.wifi_off {
             // Start as if the network had been set up before.
             app.settings.wifi_enabled = true;
@@ -388,11 +400,11 @@ fn interactive(initial: Scenario, view: View) -> Result<(), Box<dyn std::error::
             refresh();
         }
     });
-    ui.on_toggle_bodysuit({
+    ui.on_toggle_bag({
         let (app, refresh) = (app.clone(), refresh.clone());
         move || {
-            let settings = app.borrow_mut().toggle_bodysuit();
-            println!("settings: no bodysuit = {}", settings.no_bodysuit);
+            let settings = app.borrow_mut().toggle_bag();
+            println!("settings: no sleeping bag = {}", settings.no_bag);
             refresh();
         }
     });

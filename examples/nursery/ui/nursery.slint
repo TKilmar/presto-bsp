@@ -1,6 +1,6 @@
 // Nursery display for the Pimoroni Presto (480x480).
 //
-// Morning: last night's room temperature and air quality, what the night called for, and
+// Morning: last night's room temperature and air quality (PM2.5 and CO₂), what the night called for, and
 // whether it will rain today. Evening: the room now, the expected overnight low, and what the
 // baby should wear. All values arrive pre-formatted from Rust (nursery/bridge.rs); this file only
 // lays them out.
@@ -21,14 +21,10 @@ export struct Recommendation {
     valid: bool,
     // Shown instead when not valid.
     missing: string,
-    // 0 nappy only, 1 short-sleeve bodysuit, 2 long-sleeve bodysuit, 3 + footed sleepsuit,
-    // 4 footed sleepsuit without bodysuit.
+    // 0 nappy only, 1 short-sleeve bodysuit, 2 long-sleeve bodysuit, 3 + footed sleepsuit.
     outfit: int,
-    // Bodysuit the user skipped, drawn as a dotted outline: 0 none, 1 short, 2 long sleeve,
-    // 3 hidden under the sleepsuit.
-    ghost: int,
-    // The outfit has (or had) a bodysuit, so tapping the baby can toggle it.
-    can-toggle-bodysuit: bool,
+    // False when the baby sleeps without the bag (it is drawn faded; the outfit makes up for it).
+    bag-used: bool,
     outfit-label: string,
     // e.g. "2.5".
     bag-tog: string,
@@ -48,9 +44,14 @@ export struct Morning {
     temp-range: string,
     temp-detail: string,
     temp-bars: [Bar],
+    // Worse of PM2.5 and CO₂.
     air-label: string,
     air-level: int,
+    // PM2.5 mean and peak.
     air-detail: string,
+    // CO₂ mean and peak.
+    co2-detail: string,
+    // CO₂ per hour, or PM2.5 without a CO₂ sensor.
     air-bars: [Bar],
     // What the coolest part of the night called for.
     called-for: string,
@@ -65,8 +66,10 @@ export struct Evening {
     room-now: string,
     room-comfort: int,
     humidity: string,
+    // Worse of PM2.5 and CO₂.
     air-label: string,
     air-level: int,
+    // e.g. "PM 4 · CO₂ 820 ppm".
     air-detail: string,
     expected-low: string,
     // Next to the low, e.g. "2° colder outside".
@@ -135,7 +138,7 @@ global Palette {
         index == 0 ? #6fa8ff : index == 1 ? #82c98a : index == 2 ? #f2b05e : #ef7a5d
     }
 
-    // PM2.5 category: good .. hazardous.
+    // PM2.5 category good .. hazardous, or CO₂ fresh .. very stuffy (0..4).
     public pure function air(level: int) -> color {
         level == 0 ? #82c98a : level == 1 ? #e8c867 : level == 2 ? #f4a261 : level == 3 ? #ef6f5d : level == 4 ? #b07ce8 : #a2355d
     }
@@ -212,8 +215,8 @@ component BarChart inherits Rectangle {
 // Baby in the recommended clothes next to the sleeping bag.
 component Outfit inherits Rectangle {
     in property <Recommendation> recommendation;
-    // Tap on the baby: sleeping without a bodysuit, or back with one.
-    callback toggle-bodysuit();
+    // Tap on the sleeping bag: sleep without it, or with it again.
+    callback toggle-bag();
 
     HorizontalLayout {
         spacing: 6px;
@@ -230,55 +233,53 @@ component Outfit inherits Rectangle {
                     : root.recommendation.outfit == 2 ? @image-url("img/outfit-2.svg")
                     : @image-url("img/outfit-3.svg");
             }
-            // The skipped bodysuit, faded and dotted.
-            if root.recommendation.ghost == 1 || root.recommendation.ghost == 2: Image {
-                y: 0px;
-                width: parent.width;
-                height: 116px;
-                source: root.recommendation.ghost == 1 ? @image-url("img/bodysuit-ghost-1.svg")
-                    : @image-url("img/bodysuit-ghost-2.svg");
-            }
-            if root.recommendation.can-toggle-bodysuit: Text {
-                y: 116px;
-                width: parent.width;
-                horizontal-alignment: center;
-                text: root.recommendation.ghost > 0 ? "tap: add bodysuit" : "tap: no bodysuit";
-                color: root.recommendation.ghost > 0 ? Palette.accent : Palette.muted;
-                font-size: 10px;
-            }
-            if root.recommendation.can-toggle-bodysuit: TouchArea {
-                clicked => { root.toggle-bodysuit(); }
-            }
         }
         Rectangle {
             width: 80px;
             height: 128px;
-            Image {
-                width: parent.width;
-                height: parent.height;
-                source: @image-url("img/sleepbag.svg");
-                colorize: Palette.bag(root.recommendation.bag-index);
-            }
-            Image {
-                width: parent.width;
-                height: parent.height;
-                source: @image-url("img/sleepbag-detail.svg");
+            // Faded when not used, so it is clear it can be tapped back in.
+            Rectangle {
+                y: 0px;
+                height: 112px;
+                opacity: root.recommendation.bag-used ? 1 : 0.28;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: @image-url("img/sleepbag.svg");
+                    colorize: Palette.bag(root.recommendation.bag-index);
+                }
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: @image-url("img/sleepbag-detail.svg");
+                }
+                Text {
+                    y: 45px;
+                    width: parent.width;
+                    horizontal-alignment: center;
+                    text: root.recommendation.bag-tog;
+                    font-size: 20px;
+                    color: #2a2433;
+                }
+                Text {
+                    y: 69px;
+                    width: parent.width;
+                    horizontal-alignment: center;
+                    text: "TOG";
+                    font-size: 11px;
+                    color: #2a2433;
+                }
             }
             Text {
-                y: 52px;
+                y: 116px;
                 width: parent.width;
                 horizontal-alignment: center;
-                text: root.recommendation.bag-tog;
-                font-size: 22px;
-                color: #2a2433;
+                text: root.recommendation.bag-used ? "tap: no bag" : "tap: use bag";
+                color: root.recommendation.bag-used ? Palette.muted : Palette.accent;
+                font-size: 10px;
             }
-            Text {
-                y: 78px;
-                width: parent.width;
-                horizontal-alignment: center;
-                text: "TOG";
-                font-size: 11px;
-                color: #2a2433;
+            TouchArea {
+                clicked => { root.toggle-bag(); }
             }
         }
     }
@@ -291,7 +292,7 @@ component RecommendationText inherits VerticalLayout {
     alignment: center;
     Caption { text: root.heading; }
     Text {
-        text: root.recommendation.bag-tog + " TOG sleeping bag";
+        text: root.recommendation.bag-used ? root.recommendation.bag-tog + " TOG sleeping bag" : "No sleeping bag";
         color: Palette.text;
         font-size: 20px;
         wrap: word-wrap;
@@ -315,7 +316,7 @@ component RecommendationText inherits VerticalLayout {
 component RecommendationCard inherits Card {
     in property <string> heading;
     in property <Recommendation> recommendation;
-    callback toggle-bodysuit();
+    callback toggle-bag();
     if root.recommendation.valid: HorizontalLayout {
         padding: 10px;
         padding-left: 4px;
@@ -323,7 +324,7 @@ component RecommendationCard inherits Card {
         Outfit {
             width: 186px;
             recommendation: root.recommendation;
-            toggle-bodysuit => { root.toggle-bodysuit(); }
+            toggle-bag => { root.toggle-bag(); }
         }
         RecommendationText {
             heading: root.heading;
@@ -420,7 +421,7 @@ component Header inherits Rectangle {
 }
 
 component MorningView inherits VerticalLayout {
-    callback toggle-bodysuit();
+    callback toggle-bag();
     in property <Morning> data;
     in property <string> clock;
     callback clock-clicked();
@@ -474,13 +475,27 @@ component MorningView inherits VerticalLayout {
             width: (parent.width - 10px) / 2;
             VerticalLayout {
                 padding: 12px;
-                spacing: 4px;
-                Caption { text: "Air · PM2.5 µg/m³"; }
-                Chip {
-                    label: root.data.air-label;
-                    tone: Palette.air(root.data.air-level);
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Caption {
+                        text: "Air quality";
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Chip {
+                        label: root.data.air-label;
+                        tone: Palette.air(root.data.air-level);
+                    }
                 }
-                Caption { text: root.data.air-detail; }
+                Caption {
+                    text: root.data.air-detail;
+                    overflow: elide;
+                }
+                Caption {
+                    text: root.data.co2-detail;
+                    overflow: elide;
+                }
                 BarChart {
                     vertical-stretch: 1;
                     bars: root.data.air-bars;
@@ -495,7 +510,7 @@ component MorningView inherits VerticalLayout {
         vertical-stretch: 1;
         heading: root.data.called-for;
         recommendation: root.data.recommendation;
-        toggle-bodysuit => { root.toggle-bodysuit(); }
+        toggle-bag => { root.toggle-bag(); }
     }
 
     RainRow {
@@ -507,7 +522,7 @@ component MorningView inherits VerticalLayout {
 }
 
 component EveningView inherits VerticalLayout {
-    callback toggle-bodysuit();
+    callback toggle-bag();
     in property <Evening> data;
     in property <string> clock;
     callback clock-clicked();
@@ -541,7 +556,10 @@ component EveningView inherits VerticalLayout {
                     label: root.data.air-label;
                     tone: Palette.air(root.data.air-level);
                 }
-                Caption { text: root.data.air-detail; }
+                Caption {
+                    text: root.data.air-detail;
+                    overflow: elide;
+                }
             }
         }
         Card {
@@ -582,7 +600,7 @@ component EveningView inherits VerticalLayout {
         vertical-stretch: 1;
         heading: root.data.dress-for;
         recommendation: root.data.recommendation;
-        toggle-bodysuit => { root.toggle-bodysuit(); }
+        toggle-bag => { root.toggle-bag(); }
     }
 
     RainRow {
@@ -1342,8 +1360,8 @@ export component NurseryScreen inherits Window {
     callback wifi-join(string /* ssid */, string /* password */);
     callback set-sensitivity(int);
     callback set-brightness(int);
-    // Tap on the baby: dress without a bodysuit (or with one again).
-    callback toggle-bodysuit();
+    // Tap on the sleeping bag: sleep without it (or with it again).
+    callback toggle-bag();
 
     function go(target: int) {
         root.activity();
@@ -1386,7 +1404,7 @@ export component NurseryScreen inherits Window {
                 MorningView {
                     data: root.morning;
                     clock: root.clock;
-                    toggle-bodysuit => { root.activity(); root.toggle-bodysuit(); }
+                    toggle-bag => { root.activity(); root.toggle-bag(); }
                     clock-clicked => { root.activity(); root.clock-editor-open = true; }
                 }
             }
@@ -1399,7 +1417,7 @@ export component NurseryScreen inherits Window {
                 EveningView {
                     data: root.evening;
                     clock: root.clock;
-                    toggle-bodysuit => { root.activity(); root.toggle-bodysuit(); }
+                    toggle-bag => { root.activity(); root.toggle-bag(); }
                     clock-clicked => { root.activity(); root.clock-editor-open = true; }
                 }
             }

@@ -1,6 +1,6 @@
 //! A 30-hour log of readings in 10-minute buckets, and the overnight summary.
 
-use crate::air::AirQuality;
+use crate::air::{AirQuality, Co2Level};
 use crate::clock::Minutes;
 
 /// Minutes per log bucket.
@@ -17,6 +17,8 @@ pub struct Reading {
     pub humidity: Option<f32>,
     /// PM2.5, µg/m³.
     pub pm25: Option<f32>,
+    /// CO₂, ppm.
+    pub co2: Option<f32>,
     /// Outdoor temperature from the forecast for the current hour, °C.
     pub outdoor: Option<f32>,
 }
@@ -55,7 +57,7 @@ pub struct History {
     buckets: [Bucket; CAPACITY],
     len: usize,
     head: usize,
-    open: Option<(Minutes, [Mean; 4])>,
+    open: Option<(Minutes, [Mean; 5])>,
 }
 
 impl Default for History {
@@ -74,7 +76,7 @@ impl History {
             Some((open_start, _)) if *open_start > start => return, // clock moved backwards
             _ => {
                 self.close();
-                self.open = Some((start, [Mean::default(); 4]));
+                self.open = Some((start, [Mean::default(); 5]));
             }
         }
         let (_, means) = self.open.as_mut().unwrap();
@@ -82,6 +84,7 @@ impl History {
         means[1].add(reading.humidity);
         means[2].add(reading.pm25);
         means[3].add(reading.outdoor);
+        means[4].add(reading.co2);
     }
 
     fn close(&mut self) {
@@ -93,6 +96,7 @@ impl History {
                     humidity: means[1].get(),
                     pm25: means[2].get(),
                     outdoor: means[3].get(),
+                    co2: means[4].get(),
                 },
             };
             self.buckets[self.head] = bucket;
@@ -136,27 +140,30 @@ impl History {
             celsius: Stats::default(),
             humidity: Stats::default(),
             pm25: Stats::default(),
+            co2: Stats::default(),
             outdoor: Stats::default(),
             hourly: [HourSlot::default(); 12],
         };
-        let mut slot_sums = [(Mean::default(), Mean::default()); 12];
+        let mut slot_sums = [(Mean::default(), Mean::default(), Mean::default()); 12];
         for b in self.between(from, to) {
             s.covered_minutes += BUCKET_MINUTES;
             s.celsius.add(b.start, b.mean.celsius);
             s.humidity.add(b.start, b.mean.humidity);
             s.pm25.add(b.start, b.mean.pm25);
+            s.co2.add(b.start, b.mean.co2);
             s.outdoor.add(b.start, b.mean.outdoor);
             let slot = ((b.start.0 - from.0) * 12 / (to.0 - from.0).max(1)) as usize;
-            if let Some((t, pm)) = slot_sums.get_mut(slot) {
+            if let Some((t, pm, co2)) = slot_sums.get_mut(slot) {
                 t.add(b.mean.celsius);
                 pm.add(b.mean.pm25);
+                co2.add(b.mean.co2);
             }
         }
         if s.covered_minutes == 0 {
             return None;
         }
-        for (slot, (t, pm)) in s.hourly.iter_mut().zip(slot_sums) {
-            *slot = HourSlot { celsius: t.get(), pm25: pm.get() };
+        for (slot, (t, pm, co2)) in s.hourly.iter_mut().zip(slot_sums) {
+            *slot = HourSlot { celsius: t.get(), pm25: pm.get(), co2: co2.get() };
         }
         Some(s)
     }
@@ -199,6 +206,8 @@ pub struct HourSlot {
     pub celsius: Option<f32>,
     /// Mean PM2.5.
     pub pm25: Option<f32>,
+    /// Mean CO₂.
+    pub co2: Option<f32>,
 }
 
 /// Overnight summary.
@@ -216,6 +225,8 @@ pub struct NightSummary {
     pub humidity: Stats,
     /// PM2.5.
     pub pm25: Stats,
+    /// CO₂.
+    pub co2: Stats,
     /// Outdoor temperature (from the forecast).
     pub outdoor: Stats,
     /// Twelve equal slots across the period, for the charts.
@@ -233,6 +244,16 @@ impl NightSummary {
         self.pm25.max.map(|(v, _)| AirQuality::from_pm25(v))
     }
 
+    /// Ventilation from the mean CO₂.
+    pub fn co2_level(&self) -> Option<Co2Level> {
+        self.co2.mean().map(Co2Level::from_ppm)
+    }
+
+    /// Ventilation during the stuffiest 10 minutes.
+    pub fn worst_co2_level(&self) -> Option<Co2Level> {
+        self.co2.max.map(|(v, _)| Co2Level::from_ppm(v))
+    }
+
     /// Fraction of the period with data, 0..=1.
     pub fn coverage(&self) -> f32 {
         self.covered_minutes as f32 / (self.to.0 - self.from.0).max(1) as f32
@@ -244,7 +265,7 @@ mod tests {
     use super::*;
 
     fn reading(t: f32, pm: f32) -> Reading {
-        Reading { celsius: Some(t), humidity: Some(50.0), pm25: Some(pm), outdoor: None }
+        Reading { celsius: Some(t), humidity: Some(50.0), pm25: Some(pm), co2: Some(400.0 + 50.0 * pm), outdoor: None }
     }
 
     #[test]
@@ -285,6 +306,9 @@ mod tests {
         assert_eq!(s.pm25.max.unwrap().1, Minutes::hm(23, 0));
         assert_eq!(s.air_quality(), Some(AirQuality::Good));
         assert_eq!(s.worst_air_quality(), Some(AirQuality::Sensitive));
+        assert_eq!(s.co2_level(), Some(Co2Level::Fresh));
+        assert_eq!(s.worst_co2_level(), Some(Co2Level::VeryPoor));
+        assert_eq!(s.co2.max.unwrap(), (2400.0, Minutes::hm(23, 0)));
         assert!(s.hourly.iter().all(|slot| slot.celsius.is_some()));
         assert!(h.summarize(Minutes(to.0 + 600), Minutes(to.0 + 700)).is_none());
     }

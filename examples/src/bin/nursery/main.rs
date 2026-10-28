@@ -1,11 +1,11 @@
 //! Nursery display: overnight room summary in the morning, sleepwear plan in the evening.
 //!
-//! Sensors on the Qwiic connector: a PMSA003I (PM2.5) and, for temperature and humidity, an
-//! SHT4x (SHT40/41/45 at 0x44). The PMSA003I has no temperature sensor of its own. Either
-//! sensor may be missing; the screen says what it cannot show.
+//! Sensors on the Qwiic connector: a PMSA003I (PM2.5) and an SCD40 (CO₂, temperature and
+//! humidity, at 0x62). The PMSA003I has no temperature sensor of its own. Either sensor may be
+//! missing; the screen says what it cannot show.
 //!
 //! Swipe left/right between three pages: last night (morning), tonight's plan, and settings
-//! (Wi-Fi, thermal sensitivity, brightness, about). Tap the baby to dress without a bodysuit.
+//! (Wi-Fi, thermal sensitivity, brightness, about). Tap the sleeping bag to dress for a night without it.
 //!
 //! The screen turns off (backlight off) after a few minutes without a touch; touch it or press
 //! the user button to wake it. With Wi-Fi on, the clock is set and the forecast fetched over the
@@ -160,30 +160,71 @@ async fn read_pm(bus: &mut I2c<'static, I2C0, i2c::Async>) -> Option<f32> {
     }
 }
 
-async fn read_sht4x(bus: &mut I2c<'static, I2C0, i2c::Async>, address: u8) -> Option<(f32, f32)> {
-    if let Err(e) = bus.write(address, &[sensors::SHT4X_MEASURE_HIGH]).await {
-        warn!("SHT4x write: {}", defmt::Debug2Format(&e));
-        return None;
+/// Send an SCD4x command, wait for it, and read `B` bytes of response (`B` = 0: nothing).
+async fn scd4x<const B: usize>(
+    bus: &mut I2c<'static, I2C0, i2c::Async>,
+    command: u16,
+    wait_ms: u64,
+) -> Result<[u8; B], ()> {
+    let fail = |what: &str, e: &dyn core::fmt::Debug| warn!("SCD4x {:#06x} {}: {}", command, what, defmt::Debug2Format(e));
+    if let Err(e) = bus.write(sensors::SCD4X_ADDR, &command.to_be_bytes()).await {
+        fail("write", &e);
+        return Err(());
     }
-    Timer::after_millis(10).await;
-    let mut frame = [0u8; 6];
-    if let Err(e) = bus.read(address, &mut frame).await {
-        warn!("SHT4x read: {}", defmt::Debug2Format(&e));
-        return None;
+    Timer::after_millis(wait_ms).await;
+    let mut frame = [0u8; B];
+    if B > 0 {
+        if let Err(e) = bus.read(sensors::SCD4X_ADDR, &mut frame).await {
+            fail("read", &e);
+            return Err(());
+        }
     }
-    match sensors::parse_sht4x(&frame) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!("SHT4x frame {:02x}: {}", frame, defmt::Debug2Format(&e));
-            None
+    Ok(frame)
+}
+
+/// Find an SCD4x and start periodic measurement (first result after 5 s).
+async fn start_scd4x(bus: &mut I2c<'static, I2C0, i2c::Async>) -> bool {
+    use sensors::scd4x;
+    // It may still be measuring from before a reset of the Presto; it only reports its serial
+    // number when idle.
+    if scd4x::<0>(bus, scd4x::STOP_PERIODIC, scd4x::STOP_MS).await.is_err() {
+        return false;
+    }
+    let Ok(frame) = scd4x::<9>(bus, scd4x::SERIAL, scd4x::READ_MS).await else { return false };
+    let Ok(serial) = sensors::parse_words::<9, 3>(&frame) else {
+        warn!("SCD4x serial frame {:02x}: bad CRC", frame);
+        return false;
+    };
+    if scd4x::<0>(bus, scd4x::START_PERIODIC, 0).await.is_err() {
+        return false;
+    }
+    info!("SCD4x serial {:04x}{:04x}{:04x}: measuring every 5 s", serial[0], serial[1], serial[2]);
+    true
+}
+
+/// The latest SCD4x measurement, `Ok(None)` if none is ready yet, `Err` if the sensor is gone.
+async fn read_scd4x(bus: &mut I2c<'static, I2C0, i2c::Async>) -> Result<Option<sensors::Co2Reading>, ()> {
+    use sensors::scd4x;
+    let frame = scd4x::<3>(bus, scd4x::DATA_READY, scd4x::READ_MS).await?;
+    let Ok([status]) = sensors::parse_words::<3, 1>(&frame) else { return Ok(None) };
+    if status & 0x07ff == 0 {
+        return Ok(None);
+    }
+    let frame = scd4x::<9>(bus, scd4x::READ_MEASUREMENT, scd4x::READ_MS).await?;
+    match sensors::parse_scd4x(&frame) {
+        // 0 ppm is reported while the sensor is still settling.
+        Ok(r) if r.co2 > 0 => Ok(Some(r)),
+        Ok(_) => Ok(None),
+        Err(_) => {
+            warn!("SCD4x measurement frame {:02x}: bad CRC", frame);
+            Ok(None)
         }
     }
 }
 
-/// Log every address that acknowledges a read on the Qwiic bus, and return the SHT4x address if
-/// one answers a measurement.
-async fn scan_bus(bus: &mut I2c<'static, I2C0, i2c::Async>) -> Option<u8> {
-    let mut sht = None;
+/// Log every address that acknowledges a read on the Qwiic bus, then look for an SCD4x and start
+/// it. Returns whether one was found.
+async fn scan_bus(bus: &mut I2c<'static, I2C0, i2c::Async>) -> bool {
     info!("scanning Qwiic I2C");
     for address in 0x08u8..0x78 {
         let mut byte = [0u8; 1];
@@ -195,18 +236,9 @@ async fn scan_bus(bus: &mut I2c<'static, I2C0, i2c::Async>) -> Option<u8> {
             info!("I2C device at {:#04x}", address);
         }
     }
-    // An SHT4x NACKs reads until it has been asked to measure, so it only shows up when sent a
-    // measure command.
-    for address in sensors::SHT4X_ADDRS {
-        let reading =
-            embassy_time::with_timeout(Duration::from_millis(50), read_sht4x(bus, address)).await;
-        if let Ok(Some((celsius, humidity))) = reading {
-            info!("SHT4x at {:#04x}: {} C, {} %RH", address, celsius, humidity);
-            sht.get_or_insert(address);
-        }
-    }
-    info!("scan done, SHT4x at {}", sht);
-    sht
+    let scd = matches!(embassy_time::with_timeout(Duration::from_secs(1), start_scd4x(bus)).await, Ok(true));
+    info!("scan done, SCD4x {}", if scd { "found" } else { "not found" });
+    scd
 }
 
 /// Read both sensors every few seconds and publish a smoothed reading.
@@ -214,8 +246,12 @@ async fn scan_bus(bus: &mut I2c<'static, I2C0, i2c::Async>) -> Option<u8> {
 async fn sensor_task(mut bus: I2c<'static, I2C0, i2c::Async>) {
     let started = Instant::now();
     let mut pm_avg: Option<f32> = None;
-    let mut sht = scan_bus(&mut bus).await;
+    let mut scd = scan_bus(&mut bus).await;
     let mut rescan_at = Instant::now() + Duration::from_secs(30);
+    // Last SCD4x measurement and when it arrived (it measures every 5 s, as often as this loop
+    // runs, so a loop often finds nothing new).
+    let mut climate: Option<(sensors::Co2Reading, Instant)> = None;
+    let mut scd_errors = 0;
     loop {
         let pm = if started.elapsed() >= PM_WARMUP { read_pm(&mut bus).await } else { None };
         // Exponential smoothing over roughly the last 30 s.
@@ -225,18 +261,36 @@ async fn sensor_task(mut bus: I2c<'static, I2C0, i2c::Async>) {
             (None, _) => None,
         };
         // A sensor plugged in later is found by the periodic rescan.
-        if sht.is_none() && Instant::now() >= rescan_at {
-            sht = scan_bus(&mut bus).await;
+        if !scd && Instant::now() >= rescan_at {
+            scd = scan_bus(&mut bus).await;
             rescan_at = Instant::now() + Duration::from_secs(30);
         }
-        let climate = match sht {
-            Some(address) => read_sht4x(&mut bus, address).await,
-            None => None,
-        };
+        if scd {
+            match read_scd4x(&mut bus).await {
+                Ok(Some(r)) => {
+                    scd_errors = 0;
+                    if climate.is_none() {
+                        info!("SCD4x: {} ppm, {} C, {} %RH", r.co2, r.celsius, r.humidity);
+                    }
+                    climate = Some((r, Instant::now()));
+                }
+                Ok(None) => scd_errors = 0,
+                Err(()) => {
+                    scd_errors += 1;
+                    if scd_errors >= 3 {
+                        warn!("SCD4x stopped answering; rescanning");
+                        scd = false;
+                        rescan_at = Instant::now();
+                    }
+                }
+            }
+        }
+        let climate = climate.filter(|(_, at)| at.elapsed() < Duration::from_secs(30)).map(|(r, _)| r);
         READING.signal(Reading {
-            celsius: climate.map(|(t, _)| t),
-            humidity: climate.map(|(_, h)| h),
+            celsius: climate.map(|r| r.celsius),
+            humidity: climate.map(|r| r.humidity),
             pm25: pm_avg,
+            co2: climate.map(|r| r.co2 as f32),
             outdoor: None,
         });
         Timer::after_secs(5).await;
@@ -320,11 +374,11 @@ async fn main(spawner: Spawner) {
             app.update_ui(&ui.unwrap());
         }
     });
-    ui.on_toggle_bodysuit({
+    ui.on_toggle_bag({
         let (app, ui, schedule_save) = (app.clone(), ui.as_weak(), schedule_save.clone());
         move || {
             let mut app = app.borrow_mut();
-            app.toggle_bodysuit();
+            app.toggle_bag();
             app.update_ui(&ui.unwrap());
             schedule_save();
         }
@@ -495,8 +549,9 @@ async fn main(spawner: Spawner) {
         if last_stats.elapsed() >= Duration::from_secs(10) {
             last_stats = Instant::now();
             info!(
-                "display: ring underruns {}, FIFO stalls {}, late frames {}",
+                "display: ring underruns {}, core 0 pauses {}, FIFO stalls {}, late frames {}",
                 board.lcd.underruns(),
+                board.lcd.throttles(),
                 board.lcd.stalls(),
                 board.lcd.late_frames()
             );
@@ -588,7 +643,7 @@ fn saved_credentials(settings: &Settings) -> Option<wifi::Credentials> {
 fn about_rows(app: &App, psram_kib: usize, mac: &str, started: Instant) -> alloc::vec::Vec<(String, String)> {
     let up = started.elapsed().as_secs();
     let sensors = format!(
-        "PMSA003I {} · SHT4x {}",
+        "PMSA003I {} · SCD40 {}",
         if app.latest.pm25.is_some() { "ok" } else { "—" },
         if app.latest.celsius.is_some() { "ok" } else { "—" }
     );

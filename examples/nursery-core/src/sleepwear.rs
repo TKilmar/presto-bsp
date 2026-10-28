@@ -16,9 +16,10 @@ pub enum Outfit {
     LongSleeve,
     /// Long-sleeved bodysuit under a footed sleepsuit (pyjamas).
     LongSleeveAndSleepsuit,
-    /// Footed sleepsuit with no bodysuit underneath.
-    SleepsuitOnly,
 }
+
+/// Outfits to choose from without a sleeping bag, lightest first. The bodysuit stays on.
+const WITHOUT_BAG: [Outfit; 3] = [Outfit::ShortSleeve, Outfit::LongSleeve, Outfit::LongSleeveAndSleepsuit];
 
 impl Outfit {
     /// Approximate insulation of the clothing on its own, in TOG.
@@ -28,21 +29,6 @@ impl Outfit {
             Self::ShortSleeve => 0.2,
             Self::LongSleeve => 0.3,
             Self::LongSleeveAndSleepsuit => 1.3,
-            Self::SleepsuitOnly => 1.0,
-        }
-    }
-
-    /// Whether the outfit includes a bodysuit.
-    pub fn has_bodysuit(self) -> bool {
-        matches!(self, Self::ShortSleeve | Self::LongSleeve | Self::LongSleeveAndSleepsuit)
-    }
-
-    /// The same outfit with the bodysuit left out.
-    pub fn without_bodysuit(self) -> Self {
-        match self {
-            Self::ShortSleeve | Self::LongSleeve => Self::DiaperOnly,
-            Self::LongSleeveAndSleepsuit => Self::SleepsuitOnly,
-            other => other,
         }
     }
 
@@ -53,7 +39,6 @@ impl Outfit {
             Self::ShortSleeve => "Short-sleeve bodysuit",
             Self::LongSleeve => "Long-sleeve bodysuit",
             Self::LongSleeveAndSleepsuit => "Long-sleeve bodysuit + sleepsuit",
-            Self::SleepsuitOnly => "Footed sleepsuit, no bodysuit",
         }
     }
 
@@ -122,13 +107,13 @@ pub struct Recommendation {
     pub room_celsius: f32,
     /// Clothing under the bag.
     pub outfit: Outfit,
-    /// Sleeping bag TOG.
+    /// Sleeping bag TOG the chart asks for (shown faded when the bag is left out).
     pub bag_tog: f32,
+    /// False when the baby sleeps without the bag; the outfit then makes up for it.
+    pub bag_used: bool,
     /// How the room compares with the recommended range.
     pub comfort: Comfort,
-    /// Set when the user skips the bodysuit: the outfit the chart asked for.
-    pub skipped_from: Option<Outfit>,
-    /// TOG still missing when even the warmest bag cannot replace the bodysuit.
+    /// TOG still missing when even the warmest outfit cannot replace the bag.
     pub short_by: f32,
 }
 
@@ -138,7 +123,8 @@ pub const BAGS: [f32; 5] = [0.2, 0.5, 1.0, 2.5, 3.5];
 impl Recommendation {
     /// Approximate total insulation (bag plus clothing).
     pub fn total_tog(&self) -> f32 {
-        self.bag_tog + self.outfit.tog()
+        let bag = if self.bag_used { self.bag_tog } else { 0.0 };
+        bag + self.outfit.tog()
     }
 
     /// Index of the bag in the sequence 0.2, 0.5, 1.0, 2.5, 3.5 (for the UI colour).
@@ -148,33 +134,22 @@ impl Recommendation {
             .unwrap_or(0) as i32
     }
 
-    /// Adapt to a baby who sleeps without a bodysuit: drop it, and pick the lightest bag that
-    /// keeps at least the same total insulation (never a lighter bag than before).
-    pub fn without_bodysuit(self) -> Self {
-        if !self.outfit.has_bodysuit() {
-            return self;
-        }
-        let outfit = self.outfit.without_bodysuit();
+    /// Adapt to a baby who sleeps without the sleeping bag: keep the bodysuit and pick the
+    /// outfit closest to the insulation the bag and clothes would have given (no loose blankets:
+    /// if even the warmest outfit falls short, the advice says to use the bag).
+    pub fn without_bag(self) -> Self {
         let target = self.total_tog();
-        let clothes = outfit.tog();
-        let bag = BAGS
-            .iter()
-            .copied()
-            .find(|&bag| bag >= self.bag_tog && bag + clothes >= target - 0.05)
-            .unwrap_or(BAGS[BAGS.len() - 1]);
-        Self {
-            outfit,
-            bag_tog: bag,
-            skipped_from: Some(self.outfit),
-            short_by: (target - bag - clothes).max(0.0),
-            ..self
-        }
+        let outfit = WITHOUT_BAG
+            .into_iter()
+            .min_by(|a, b| (a.tog() - target).abs().total_cmp(&(b.tog() - target).abs()))
+            .unwrap_or(Outfit::LongSleeveAndSleepsuit);
+        Self { outfit, bag_used: false, short_by: (target - outfit.tog()).max(0.0), ..self }
     }
 
     /// One-line advice for the parent, or `""`.
     pub fn advice(&self) -> &'static str {
-        if self.short_by > 0.05 {
-            return "Warmest bag still a little light: add a layer";
+        if self.short_by > 0.25 {
+            return "Too cool without a bag tonight";
         }
         match self.comfort {
             Comfort::Hot => "Hot room: cool it, no blankets",
@@ -230,8 +205,8 @@ pub fn recommend_for(room_celsius: f32, sensitivity: i8) -> Recommendation {
         room_celsius,
         outfit: band.outfit,
         bag_tog: band.bag_tog,
+        bag_used: true,
         comfort: Comfort::from_room(room_celsius),
-        skipped_from: None,
         short_by: 0.0,
     }
 }
@@ -251,21 +226,22 @@ mod tests {
     }
 
     #[test]
-    fn without_bodysuit_keeps_insulation() {
-        // 21 °C: 1.0 TOG + long sleeve (1.3) -> nappy only needs the 2.5 TOG bag.
-        let r = recommend(21.0).without_bodysuit();
-        assert_eq!((r.outfit, r.bag_tog, r.skipped_from), (Outfit::DiaperOnly, 2.5, Some(Outfit::LongSleeve)));
-        // 25 °C: 0.5 TOG + short sleeve (0.7) -> 1.0 TOG bag.
-        assert_eq!(recommend(25.0).without_bodysuit().bag_tog, 1.0);
-        // 23 °C: 1.0 + short sleeve (1.2) -> 2.5 bag (no 1.2 bag exists).
-        assert_eq!(recommend(23.0).without_bodysuit().bag_tog, 2.5);
-        // 12 °C: 3.5 + sleepsuit + bodysuit (4.8) -> sleepsuit only, 3.5 bag, 0.3 short.
-        let r = recommend(12.0).without_bodysuit();
-        assert_eq!((r.outfit, r.bag_tog), (Outfit::SleepsuitOnly, 3.5));
-        assert!((r.short_by - 0.3).abs() < 0.01);
-        assert!(r.advice().contains("add a layer"));
-        // Nothing to skip at 28 °C.
-        assert_eq!(recommend(28.0).without_bodysuit(), recommend(28.0));
+    fn without_bag_dresses_warmer() {
+        // 28 °C: 0.2 TOG bag + nappy -> short-sleeve bodysuit (the bodysuit always stays on).
+        let r = recommend(28.0).without_bag();
+        assert_eq!((r.outfit, r.bag_used, r.bag_tog), (Outfit::ShortSleeve, false, 0.2));
+        assert!((r.total_tog() - 0.2).abs() < 0.01);
+        // 25 °C: 0.5 + short sleeve (0.7) -> long sleeve is closest.
+        assert_eq!(recommend(25.0).without_bag().outfit, Outfit::LongSleeve);
+        // 21 °C: 1.0 + long sleeve (1.3) -> sleepsuit over the bodysuit.
+        let r = recommend(21.0).without_bag();
+        assert_eq!(r.outfit, Outfit::LongSleeveAndSleepsuit);
+        assert!(r.short_by < 0.01 && !r.advice().contains("Too cool"));
+        // 18 °C: 2.5 + long sleeve (2.8) -> warmest outfit, 1.5 short: use the bag.
+        let r = recommend(18.0).without_bag();
+        assert_eq!(r.outfit, Outfit::LongSleeveAndSleepsuit);
+        assert!((r.short_by - 1.5).abs() < 0.01);
+        assert!(r.advice().contains("Too cool"));
     }
 
     #[test]

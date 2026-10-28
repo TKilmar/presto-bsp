@@ -74,8 +74,8 @@ pub struct Settings {
     pub ssid: InlineStr<SSID_MAX>,
     /// Its passphrase (empty for an open network).
     pub password: InlineStr<PASSWORD_MAX>,
-    /// The baby sleeps without a bodysuit; recommendations compensate with a warmer bag.
-    pub no_bodysuit: bool,
+    /// The baby sleeps without a sleeping bag; recommendations compensate with warmer clothes.
+    pub no_bag: bool,
 }
 
 impl Default for Settings {
@@ -86,7 +86,7 @@ impl Default for Settings {
             wifi_enabled: false,
             ssid: InlineStr::new(),
             password: InlineStr::new(),
-            no_bodysuit: false,
+            no_bag: false,
         }
     }
 }
@@ -127,7 +127,8 @@ impl Settings {
         let p = 9 + SSID_MAX;
         b[p] = self.password.len;
         b[p + 1..p + 1 + PASSWORD_MAX].copy_from_slice(&self.password.bytes);
-        b[p + 1 + PASSWORD_MAX] = self.no_bodysuit as u8;
+        // 2, not 1: firmware before the sleeping-bag toggle stored "no bodysuit" as 1 here.
+        b[p + 1 + PASSWORD_MAX] = if self.no_bag { 2 } else { 0 };
         let crc = crc32(&b[..STORED_SIZE - 4]);
         b[STORED_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
         b
@@ -154,7 +155,7 @@ impl Settings {
                 wifi_enabled: b[7] != 0,
                 ssid: InlineStr::from_str_truncated(ssid),
                 password: InlineStr::from_str_truncated(password),
-                no_bodysuit: b[p + 1 + PASSWORD_MAX] == 1,
+                no_bag: b[p + 1 + PASSWORD_MAX] == 2,
             }
             .sanitized(),
         )
@@ -173,7 +174,7 @@ mod tests {
             wifi_enabled: true,
             ssid: InlineStr::from_str_truncated("Nursery Wi-Fi"),
             password: InlineStr::from_str_truncated("correct horse battery"),
-            no_bodysuit: true,
+            no_bag: true,
         };
         let bytes = s.to_bytes();
         assert_eq!(Settings::from_bytes(&bytes), Some(s));

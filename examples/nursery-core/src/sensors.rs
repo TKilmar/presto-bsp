@@ -2,12 +2,26 @@
 
 /// PMSA003I particulate sensor: 7-bit I2C address.
 pub const PMSA003I_ADDR: u8 = 0x12;
-/// SHT4x temperature/humidity sensor: 7-bit I2C address (SHT40/41/45 "A" variants).
-pub const SHT4X_ADDR: u8 = 0x44;
-/// All SHT4x addresses ("A", "B" and "C" variants).
-pub const SHT4X_ADDRS: [u8; 3] = [0x44, 0x45, 0x46];
-/// SHT4x command: measure T and RH with high repeatability (result ready after 8.3 ms).
-pub const SHT4X_MEASURE_HIGH: u8 = 0xFD;
+/// SCD4x (SCD40/41) CO₂, temperature and humidity sensor: 7-bit I2C address.
+pub const SCD4X_ADDR: u8 = 0x62;
+
+/// SCD4x commands (16-bit, sent big-endian) and how long to wait before the next transfer.
+pub mod scd4x {
+    /// Start measuring every 5 s. The first result is ready 5 s later.
+    pub const START_PERIODIC: u16 = 0x21b1;
+    /// Stop measuring. Accepted in any mode; the sensor ignores commands for 500 ms afterwards.
+    pub const STOP_PERIODIC: u16 = 0x3f86;
+    /// Milliseconds to wait after [`STOP_PERIODIC`].
+    pub const STOP_MS: u64 = 500;
+    /// Read the 48-bit serial number (3 words); only while idle.
+    pub const SERIAL: u16 = 0x3682;
+    /// Whether a new measurement is ready (1 word; ready if the low 11 bits are not all zero).
+    pub const DATA_READY: u16 = 0xe4b8;
+    /// Read the last measurement (3 words: CO₂, temperature, humidity). Clears data-ready.
+    pub const READ_MEASUREMENT: u16 = 0xec05;
+    /// Milliseconds between sending a read command and reading its response.
+    pub const READ_MS: u64 = 1;
+}
 
 /// One PMSA003I report (concentrations in µg/m³, counts per 0.1 L of air).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,16 +84,38 @@ pub fn sensirion_crc(data: &[u8]) -> u8 {
     crc
 }
 
-/// Decode the 6-byte SHT4x measurement into (°C, %RH).
-pub fn parse_sht4x(frame: &[u8; 6]) -> Result<(f32, f32), FrameError> {
-    if sensirion_crc(&frame[0..2]) != frame[2] || sensirion_crc(&frame[3..5]) != frame[5] {
-        return Err(FrameError::Checksum);
+/// Decode a Sensirion response: 16-bit big-endian words, each followed by its CRC.
+pub fn parse_words<const B: usize, const W: usize>(frame: &[u8; B]) -> Result<[u16; W], FrameError> {
+    debug_assert_eq!(B, 3 * W);
+    let mut words = [0u16; W];
+    for (word, chunk) in words.iter_mut().zip(frame.chunks_exact(3)) {
+        if sensirion_crc(&chunk[..2]) != chunk[2] {
+            return Err(FrameError::Checksum);
+        }
+        *word = u16::from_be_bytes([chunk[0], chunk[1]]);
     }
-    let t = u16::from_be_bytes([frame[0], frame[1]]) as f32;
-    let rh = u16::from_be_bytes([frame[3], frame[4]]) as f32;
-    let celsius = -45.0 + 175.0 * t / 65535.0;
-    let humidity = (-6.0 + 125.0 * rh / 65535.0).clamp(0.0, 100.0);
-    Ok((celsius, humidity))
+    Ok(words)
+}
+
+/// One SCD4x measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Co2Reading {
+    /// CO₂, ppm.
+    pub co2: u16,
+    /// Temperature, °C (with the sensor's default 4 °C self-heating offset already applied).
+    pub celsius: f32,
+    /// Relative humidity, %.
+    pub humidity: f32,
+}
+
+/// Decode the 9-byte response to [`scd4x::READ_MEASUREMENT`].
+pub fn parse_scd4x(frame: &[u8; 9]) -> Result<Co2Reading, FrameError> {
+    let [co2, t, rh] = parse_words::<9, 3>(frame)?;
+    Ok(Co2Reading {
+        co2,
+        celsius: -45.0 + 175.0 * t as f32 / 65535.0,
+        humidity: (100.0 * rh as f32 / 65535.0).clamp(0.0, 100.0),
+    })
 }
 
 #[cfg(test)]
@@ -104,19 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn sht4x_frame() {
+    fn scd4x_frame() {
         // Datasheet CRC example: 0xBEEF -> 0x92.
         assert_eq!(sensirion_crc(&[0xbe, 0xef]), 0x92);
-        let t = (((25.0 + 45.0) / 175.0) * 65535.0) as u16;
-        let rh = (((50.0 + 6.0) / 125.0) * 65535.0) as u16;
-        let mut f = [0u8; 6];
-        f[..2].copy_from_slice(&t.to_be_bytes());
-        f[2] = sensirion_crc(&f[..2]);
-        f[3..5].copy_from_slice(&rh.to_be_bytes());
-        f[5] = sensirion_crc(&f[3..5]);
-        let (c, h) = parse_sht4x(&f).unwrap();
-        assert!((c - 25.0).abs() < 0.01 && (h - 50.0).abs() < 0.01);
-        f[5] ^= 1;
-        assert!(parse_sht4x(&f).is_err());
+        // Datasheet read_measurement example: 500 ppm, 25 °C (0x6667), 37 %RH (0x5EB9).
+        let f = [0x01, 0xf4, 0x33, 0x66, 0x67, 0xa2, 0x5e, 0xb9, 0x3c];
+        let r = parse_scd4x(&f).unwrap();
+        assert_eq!(r.co2, 500);
+        assert!((r.celsius - 25.0).abs() < 0.01, "{}", r.celsius);
+        assert!((r.humidity - 37.0).abs() < 0.01, "{}", r.humidity);
+        let mut bad = f;
+        bad[8] ^= 1;
+        assert_eq!(parse_scd4x(&bad), Err(FrameError::Checksum));
     }
 }

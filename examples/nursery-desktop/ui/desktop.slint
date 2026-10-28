@@ -10,11 +10,15 @@ export struct Scenario {
     room: float,
     humidity: float,
     pm25: float,
+    co2: float,
     // Last night.
+
     night-start: float,
     night-drop: float,
     night-pm: float,
     night-spike: bool,
+    // CO₂ at 07:00 (it climbs from 600 ppm at 19:00).
+    night-co2: float,
     // Forecast.
     has-forecast: bool,
     outdoor-low: float,
@@ -61,7 +65,7 @@ export component SimControls inherits Window {
     preferred-height: 760px;
 
     in-out property <Scenario> scenario: {
-        time: 20 * 60, room: 21.5, humidity: 48, pm25: 4,
+        time: 20 * 60, room: 21.5, humidity: 48, pm25: 4, co2: 650, night-co2: 1150,
         night-start: 21, night-drop: 2.5, night-pm: 5, night-spike: false,
         has-forecast: true, outdoor-low: 6, rain-chance: 70, rain-hour: 14,
         has-temp: true, has-pm: true, timeout: 180,
@@ -113,6 +117,13 @@ export component SimControls inherits Window {
                         value: round(root.scenario.pm25) + " µg/m³";
                         changed => { root.changed(); }
                     }
+                    Row {
+                        label: "CO₂";
+                        minimum: 400; maximum: 3000; step: 10;
+                        current <=> root.scenario.co2;
+                        value: round(root.scenario.co2) + " ppm";
+                        changed => { root.changed(); }
+                    }
                 }
             }
 
@@ -139,6 +150,13 @@ export component SimControls inherits Window {
                         minimum: 0; maximum: 100;
                         current <=> root.scenario.night-pm;
                         value: round(root.scenario.night-pm) + " µg/m³";
+                        changed => { root.changed(); }
+                    }
+                    Row {
+                        label: "CO₂ by 07:00";
+                        minimum: 400; maximum: 3000; step: 10;
+                        current <=> root.scenario.night-co2;
+                        value: round(root.scenario.night-co2) + " ppm";
                         changed => { root.changed(); }
                     }
                     CheckBox {
@@ -187,7 +205,7 @@ export component SimControls inherits Window {
                 VerticalLayout {
                     spacing: 4px;
                     CheckBox {
-                        text: "Temperature sensor (SHT4x)";
+                        text: "CO₂ / temperature sensor (SCD40)";
                         checked <=> root.scenario.has-temp;
                         toggled => { root.changed(); }
                     }
