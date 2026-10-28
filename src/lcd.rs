@@ -35,6 +35,7 @@ use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::ChannelInstance;
 use embassy_rp::gpio::Output;
 use embassy_rp::pac;
+use embassy_rp::pac::interrupt;
 use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::{CORE1, DMA_CH1, DMA_CH2, DMA_CH3, DMA_CH4, DMA_CH8, PIO1, SPI1};
 use embassy_rp::pio::program::{InstructionOperands, OutDestination, pio_asm};
@@ -170,7 +171,8 @@ static FRAME_ADDR: AtomicU32 = AtomicU32::new(0);
 ///   falls behind it sends the stale ring contents rather than stalling (a few wrong pixels for
 ///   one frame, counted by [`St7701::underruns`]).
 /// * At the end of every frame it resets the data state machine and starts again from the first
-///   pixel, so a glitch can never shift the picture.
+///   pixel, so a glitch can never shift the picture. The copy does not stop at the end of a
+///   frame: it runs on into the next one, so the ring is full again when that frame starts.
 pub mod ring {
     /// Ring size in 32-bit words (64 KiB, ~68 lines).
     pub const WORDS: u32 = 16384;
@@ -178,6 +180,29 @@ pub mod ring {
     pub const CHUNK: u32 = 256;
     /// How far the copy runs ahead of the scan-out, in words (~2.4 ms at 47 Hz).
     pub const LEAD: u32 = 15360;
+    /// Below this lead core 1 makes core 0 wait (see [`SIO_IRQ_BELL`](super::SIO_IRQ_BELL))…
+    pub const LOW: u32 = LEAD / 2;
+    /// …until the lead is back up to this.
+    pub const HIGH: u32 = LEAD - 3 * CHUNK;
+}
+
+/// Core 0's doorbell interrupt, rung by core 1 when the scan-out copy falls behind: wait, from
+/// SRAM, until it has caught up. Code and data that core 0 fetches from flash share the QSPI bus
+/// with the PSRAM copy, and also break up the copy's sequential reads into much slower single
+/// transfers, so heavy work on core 0 (Slint laying out a frame, say) can starve the panel.
+/// Pacing only the pixel writes is not enough; this pauses whatever core 0 is doing.
+#[interrupt]
+#[unsafe(link_section = ".data.lcd_bell")]
+fn SIO_IRQ_BELL() {
+    pac::SIO.doorbell_in_clr().write(|w| w.set_doorbell_in_clr(1));
+    THROTTLES.fetch_add(1, Ordering::Relaxed);
+    // Bounded (a few ms), in case the scan-out stops.
+    for _ in 0..1_000_000 {
+        if RING_LEAD.load(Ordering::Relaxed) >= ring::HIGH {
+            break;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[repr(C, align(4))]
@@ -188,6 +213,8 @@ struct Ring([u32; ring::WORDS as usize]);
 static RING_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Times the copy fell behind the scan-out (diagnostics).
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+/// Times core 1 had core 0 wait for the copy to catch up (diagnostics).
+static THROTTLES: AtomicU32 = AtomicU32::new(0);
 /// Times the data state machine ran out of pixels mid-frame (diagnostics).
 static STALLS: AtomicU32 = AtomicU32::new(0);
 /// Frames that had not been fully sent when the next one was due (diagnostics).
@@ -252,32 +279,57 @@ fn pump(data_origin: u8) -> ! {
     let full_bit = 1 << DATA_SM;
 
     let mut frame = FRAME_ADDR.load(Ordering::Acquire);
-    // Words sent to the state machine, copy issued up to, copy completed up to (this frame).
+    // Buffer of the next frame, once the copy has run past the end of this one.
+    let mut next_frame = frame;
+    // Ring slot of this frame's first word: the copy runs on into the next frame, so frames
+    // do not start at slot 0.
+    let mut base = 0u32;
+    // Words sent to the state machine, copy issued up to, copy completed up to (counted from
+    // the start of this frame; past FRAME_WORDS is the next frame).
     let mut sent = 0u32;
     let mut issued = 0u32;
     let mut copied = 0u32;
     let mut copying = false;
-    // All of this frame sent; waiting for the next frame's start (copy for it may already run).
+    // All of this frame sent; waiting for the next frame's start (its copy keeps running).
     let mut waiting = true;
+    // Core 0 has been asked to wait for the copy.
+    let mut belled = false;
     loop {
         if copying && !copy.ctrl_trig().read().busy() {
             copying = false;
             copied = issued;
         }
-        if !copying && issued < FRAME_WORDS && issued < sent + ring::LEAD {
+        if !copying && issued < sent + ring::LEAD {
             if issued < sent {
                 // The copy fell behind; skip to where the scan-out is.
                 UNDERRUNS.fetch_add(1, Ordering::Relaxed);
                 issued = sent.next_multiple_of(ring::CHUNK);
                 copied = issued;
             } else {
-                let dst = ring as u32 + (issued % ring::WORDS) * 4;
-                start_copy(frame + issued * 4, dst, ring::CHUNK);
+                // CHUNK divides FRAME_WORDS, so a chunk never spans two frames.
+                let src = if issued < FRAME_WORDS {
+                    frame + issued * 4
+                } else {
+                    if issued == FRAME_WORDS {
+                        next_frame = FRAME_ADDR.load(Ordering::Acquire);
+                    }
+                    next_frame + (issued - FRAME_WORDS) * 4
+                };
+                let dst = ring as u32 + ((base + issued) % ring::WORDS) * 4;
+                start_copy(src, dst, ring::CHUNK);
                 issued += ring::CHUNK;
                 copying = true;
             }
         }
-        RING_LEAD.store(if copied >= FRAME_WORDS { u32::MAX } else { copied.saturating_sub(sent) }, Ordering::Relaxed);
+        let lead = copied.saturating_sub(sent);
+        RING_LEAD.store(lead, Ordering::Relaxed);
+        if lead < ring::LOW && !belled {
+            // Have core 0 stop competing for the QSPI bus until the copy has caught up.
+            pac::SIO.doorbell_out_set().write(|w| w.set_doorbell_out_set(1));
+            belled = true;
+        } else if lead >= ring::HIGH {
+            belled = false;
+        }
 
         if pio.irq().read().irq() & (1 << FRAME_IRQ) != 0 {
             pio.irq().write(|w| w.set_irq(1 << FRAME_IRQ));
@@ -287,7 +339,7 @@ fn pump(data_origin: u8) -> ! {
                 while copy.ctrl_trig().read().busy() {}
                 copying = false;
                 frame = FRAME_ADDR.load(Ordering::Acquire);
-                (sent, issued, copied) = (0, 0, 0);
+                (base, sent, issued, copied) = (0, 0, 0, 0);
             }
             reset_data_sm(data_origin);
             waiting = false;
@@ -307,17 +359,26 @@ fn pump(data_origin: u8) -> ! {
                 pio.fdebug().write(|w| w.set_txstall(full_bit));
             }
             // SAFETY: in bounds; the copy DMA may be writing other words of the ring.
-            let word = unsafe { core::ptr::read_volatile(ring.add((sent % ring::WORDS) as usize)) };
+            let slot = (base + sent) % ring::WORDS;
+            let word = unsafe { core::ptr::read_volatile(ring.add(slot as usize)) };
             unsafe { core::ptr::write_volatile(txf, word) };
             sent += 1;
         }
         if sent == FRAME_WORDS {
-            // Frame sent. Start copying the next one during vertical blanking.
+            // Frame sent. What has been copied beyond it is the start of the next frame.
             waiting = true;
-            while copy.ctrl_trig().read().busy() {}
-            copying = false;
-            frame = FRAME_ADDR.load(Ordering::Acquire);
-            (sent, issued, copied) = (0, 0, 0);
+            if issued < FRAME_WORDS {
+                // The copy never got past this frame (it skipped ahead after an underrun).
+                next_frame = FRAME_ADDR.load(Ordering::Acquire);
+                (issued, copied) = (FRAME_WORDS, FRAME_WORDS);
+                while copy.ctrl_trig().read().busy() {}
+                copying = false;
+            }
+            frame = next_frame;
+            base = (base + FRAME_WORDS) % ring::WORDS;
+            sent = 0;
+            issued -= FRAME_WORDS;
+            copied = copied.max(FRAME_WORDS) - FRAME_WORDS;
         }
     }
 }
@@ -810,6 +871,10 @@ impl<'d> St7701<'d> {
                 let stack = unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) };
                 spawn_core1(core1, stack, move || pump(data_origin));
             }
+            use embassy_rp::interrupt::{InterruptExt, Priority};
+            embassy_rp::interrupt::SIO_IRQ_BELL.set_priority(Priority::P0);
+            // SAFETY: the handler only reads an atomic and acknowledges the doorbell.
+            unsafe { embassy_rp::interrupt::SIO_IRQ_BELL.enable() };
         } else {
             arm_loop(px, px_rearm, &FRAME_ADDR, txf(DATA_SM), FRAME_WORDS, DREQ_PIO1_TX0 + DATA_SM as u8, 0);
         }
@@ -836,6 +901,12 @@ impl<'d> St7701<'d> {
     /// only). Each shows as a few stale pixels, e.g. while flash is being written.
     pub fn underruns(&self) -> u32 {
         UNDERRUNS.load(Ordering::Relaxed)
+    }
+
+    /// Times core 0 was paused so the PSRAM copy could catch up (each pause lasts well under a
+    /// millisecond).
+    pub fn throttles(&self) -> u32 {
+        THROTTLES.load(Ordering::Relaxed)
     }
 
     /// Times the data state machine ran out of pixels mid-line since start (PSRAM frame buffers
